@@ -5,12 +5,19 @@ import copy
 import json
 import logging
 import re
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 
-from app.config import settings
-from app.database import db
+from app.ai_limits import MAX_ITEM_WORKERS, PromptSizeError, require_source_size
+from app.ai_budget import (
+    AIOperationDeadlineExceeded,
+    AIOperationRoute,
+    remaining_timeout,
+)
+from app.config_cache import get_content_language
+from app.database import DatabaseBusyError, db
 from app.llm import complete_json
 from app.prompts.enrichment import (
     ANALYZE_RESUME_PROMPT,
@@ -25,6 +32,7 @@ from app.schemas.enrichment import (
     ApplyEnhancementsRequest,
     EnhancedDescription,
     EnhanceRequest,
+    EnhancementItemError,
     EnhancementPreview,
     EnrichmentItem,
     EnrichmentQuestion,
@@ -37,20 +45,100 @@ from app.schemas.enrichment import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/enrichment", tags=["Enrichment"])
+router = APIRouter(
+    route_class=AIOperationRoute, prefix="/enrichment", tags=["Enrichment"]
+)
 
 
-def _get_content_language() -> str:
-    """Get content language from stored config."""
-    config_path = settings.config_path
+def _validate_text_replacements(
+    result: dict[str, Any],
+    field_names: tuple[str, ...],
+) -> dict[str, Any]:
+    """Require a non-empty replacement list without coercing invalid leaves."""
+    present_fields = [name for name in field_names if name in result]
+    if not present_fields:
+        raise ValueError(f"LLM response is missing '{field_names[0]}'")
+    for field in present_fields:
+        replacements = result[field]
+        if isinstance(replacements, list) and replacements and all(
+            isinstance(item, str) and item.strip() for item in replacements
+        ):
+            return {
+                **result,
+                field_names[0]: [item.strip() for item in replacements],
+            }
+    raise ValueError(
+        f"LLM response fields {present_fields!r} must contain non-empty text lists"
+    )
+
+
+def _validate_enhancement_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate enhanced bullets, including the legacy response field name."""
+    return _validate_text_replacements(
+        result,
+        ("additional_bullets", "enhanced_description"),
+    )
+
+
+def _validate_regenerated_item_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate regenerated experience or project bullets."""
+    return _validate_text_replacements(result, ("new_bullets",))
+
+
+def _validate_regenerated_skills_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate regenerated skill names."""
+    return _validate_text_replacements(result, ("new_skills",))
+
+
+def _validate_analysis_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Require the explicit enrichment-analysis contract; empty lists are valid."""
+    if "items_to_enrich" not in result or "questions" not in result:
+        raise ValueError("LLM analysis response is missing required list fields")
+    return AnalysisResponse.model_validate(result).model_dump()
+
+
+def _extract_item_from_resume(processed_data: dict, item_id: str) -> dict:
+    """Derive item details from resume data using the item_id pattern.
+
+    Avoids a redundant LLM analysis call when the frontend already knows
+    which item each answer belongs to.
+    """
     try:
-        if config_path.exists():
-            config = json.loads(config_path.read_text())
-            # Use content_language, fall back to legacy 'language' field, then default to 'en'
-            return config.get("content_language", config.get("language", "en"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning(f"Failed to read content language from config: {e}")
-    return "en"
+        prefix, idx_str = item_id.split("_", 1)
+        index = int(idx_str)
+    except (ValueError, AttributeError):
+        return {}
+
+    if index < 0:
+        return {}
+
+    if prefix == "exp":
+        entries = processed_data.get("workExperience", [])
+        if not isinstance(entries, list) or index >= len(entries):
+            return {}
+        entry = entries[index]
+        desc = entry.get("description", [])
+        return {
+            "item_id": item_id,
+            "item_type": "experience",
+            "title": entry.get("title", ""),
+            "subtitle": entry.get("company", ""),
+            "current_description": desc if isinstance(desc, list) else [desc] if isinstance(desc, str) and desc else [],
+        }
+    elif prefix == "proj":
+        entries = processed_data.get("personalProjects", [])
+        if not isinstance(entries, list) or index >= len(entries):
+            return {}
+        entry = entries[index]
+        desc = entry.get("description", [])
+        return {
+            "item_id": item_id,
+            "item_type": "project",
+            "title": entry.get("name", ""),
+            "subtitle": entry.get("role", ""),
+            "current_description": desc if isinstance(desc, list) else [desc] if isinstance(desc, str) and desc else [],
+        }
+    return {}
 
 
 @router.post("/analyze/{resume_id}", response_model=AnalysisResponse)
@@ -61,7 +149,7 @@ async def analyze_resume(resume_id: str) -> AnalysisResponse:
     vague, or incomplete descriptions and generates clarifying questions.
     """
     # Fetch resume
-    resume = db.get_resume(resume_id)
+    resume = await db.get_resume(resume_id)
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 
@@ -73,9 +161,11 @@ async def analyze_resume(resume_id: str) -> AnalysisResponse:
             detail="Resume has no processed data. Please re-upload the resume.",
         )
 
+    require_source_size(processed_data)
+
     # Build prompt with content language
-    resume_json = json.dumps(processed_data, indent=2)
-    language = _get_content_language()
+    resume_json = json.dumps(processed_data)
+    language = get_content_language()
     output_language = get_language_name(language)
     prompt = ANALYZE_RESUME_PROMPT.format(
         resume_json=resume_json,
@@ -84,7 +174,16 @@ async def analyze_resume(resume_id: str) -> AnalysisResponse:
 
     try:
         # Call LLM with increased max_tokens for non-English languages
-        result = await complete_json(prompt, max_tokens=8192)
+        result = await asyncio.wait_for(
+            complete_json(
+                prompt,
+                max_tokens=8192,
+                schema_type="enrichment",
+                response_validator=_validate_analysis_result,
+            ),
+            timeout=remaining_timeout(),
+        )
+        result = _validate_analysis_result(result)
 
         # Parse response into schema objects
         items_to_enrich = [
@@ -115,8 +214,22 @@ async def analyze_resume(resume_id: str) -> AnalysisResponse:
             analysis_summary=result.get("analysis_summary"),
         )
 
+    except PromptSizeError:
+        raise
+    except asyncio.TimeoutError:
+        logger.error("Resume analysis timed out for resume %s", resume_id)
+        raise HTTPException(
+            status_code=504,
+            detail="Resume analysis timed out. Please try again with a shorter resume or a faster model.",
+        )
+    except ValueError as e:
+        logger.error("Resume analysis failed (content): %s", e)
+        raise HTTPException(
+            status_code=422,
+            detail="The AI returned an unreadable response. Please try again or switch models.",
+        )
     except Exception as e:
-        logger.error(f"Resume analysis failed: {e}")
+        logger.error("Resume analysis failed: %s", e)
         raise HTTPException(
             status_code=500,
             detail="Failed to analyze resume. Please try again.",
@@ -131,7 +244,7 @@ async def generate_enhancements(request: EnhanceRequest) -> EnhancementPreview:
     improved description bullets for each item.
     """
     # Fetch resume
-    resume = db.get_resume(request.resume_id)
+    resume = await db.get_resume(request.resume_id)
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 
@@ -142,73 +255,107 @@ async def generate_enhancements(request: EnhanceRequest) -> EnhancementPreview:
             detail="Resume has no processed data.",
         )
 
-    # Group answers by item_id (extract from question_id pattern)
-    # Question IDs are like "q_0", "q_1", etc. but we need to know which item each belongs to
-    # First, we need to re-analyze to get the mapping, or we need the items passed in
-    # For simplicity, we'll call analyze again to get the question-to-item mapping
+    require_source_size(processed_data)
 
-    # Actually, let's parse the answers differently - the frontend should include item context
-    # For now, we'll get the analysis to build the mapping
-    resume_json = json.dumps(processed_data, indent=2)
-    language = _get_content_language()
-    output_language = get_language_name(language)
-    analysis_prompt = ANALYZE_RESUME_PROMPT.format(
-        resume_json=resume_json,
-        output_language=output_language
-    )
+    # Group answers by item_id.
+    # When all answers carry item_id (from the analysis step), we can skip
+    # the expensive re-analysis LLM call and derive item details from the
+    # resume's processed_data directly.
+    answers_by_item: dict[str, list[AnswerInput]] = {}
+    item_details: dict[str, dict] = {}
+    # question_id → question dict, populated only in the legacy path
+    questions_by_id: dict[str, dict] = {}
 
-    try:
-        analysis_result = await complete_json(analysis_prompt, max_tokens=8192)
-    except Exception as e:
-        logger.error(f"Failed to re-analyze resume: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to process enhancements. Please try again.",
+    if all(a.item_id for a in request.answers) and all(
+        _extract_item_from_resume(processed_data, a.item_id or "")
+        for a in request.answers
+    ):
+        # Fast path — no re-analysis needed
+        for answer in request.answers:
+            item_id = answer.item_id or ""
+            answers_by_item.setdefault(item_id, []).append(answer)
+            if item_id not in item_details:
+                item_details[item_id] = _extract_item_from_resume(
+                    processed_data, item_id
+                )
+    else:
+        # Legacy path — re-analyze to get question-to-item mapping
+        resume_json = json.dumps(processed_data)
+        language = get_content_language()
+        output_language = get_language_name(language)
+        analysis_prompt = ANALYZE_RESUME_PROMPT.format(
+            resume_json=resume_json,
+            output_language=output_language,
         )
 
-    # Build question_id -> item_id mapping
-    question_to_item: dict[str, str] = {}
-    for q in analysis_result.get("questions", []):
-        question_to_item[q.get("question_id", "")] = q.get("item_id", "")
+        try:
+            analysis_result = await asyncio.wait_for(
+                complete_json(
+                    analysis_prompt,
+                    max_tokens=8192,
+                    schema_type="enrichment",
+                    response_validator=_validate_analysis_result,
+                ),
+                timeout=remaining_timeout(),
+            )
+            analysis_result = _validate_analysis_result(analysis_result)
+        except PromptSizeError:
+            raise
+        except asyncio.TimeoutError:
+            logger.error("Resume re-analysis timed out for resume %s", request.resume_id)
+            raise HTTPException(
+                status_code=504,
+                detail="Resume analysis timed out. Please try again with a shorter resume or a faster model.",
+            )
+        except ValueError as e:
+            logger.error("Resume re-analysis failed (content): %s", e)
+            raise HTTPException(
+                status_code=422,
+                detail="The AI returned an unreadable response. Please try again or switch models.",
+            )
+        except Exception as e:
+            logger.error("Failed to re-analyze resume: %s", e)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to process enhancements. Please try again.",
+            )
 
-    # Build item details mapping
-    item_details: dict[str, dict] = {}
-    for item in analysis_result.get("items_to_enrich", []):
-        item_id = item.get("item_id", "")
-        item_details[item_id] = item
+        question_to_item: dict[str, str] = {}
+        for q in analysis_result.get("questions", []):
+            qid = q.get("question_id", "")
+            question_to_item[qid] = q.get("item_id", "")
+            questions_by_id[qid] = q
 
-    # Group answers by item_id
-    answers_by_item: dict[str, list[AnswerInput]] = {}
-    for answer in request.answers:
-        item_id = question_to_item.get(answer.question_id, "")
-        if item_id:
-            if item_id not in answers_by_item:
-                answers_by_item[item_id] = []
-            answers_by_item[item_id].append(answer)
+        for item in analysis_result.get("items_to_enrich", []):
+            item_id = item.get("item_id", "")
+            item_details[item_id] = item
+
+        for answer in request.answers:
+            item_id = question_to_item.get(answer.question_id, "")
+            if item_id:
+                answers_by_item.setdefault(item_id, []).append(answer)
 
     # Generate enhanced descriptions for each item
     enhancements: list[EnhancedDescription] = []
+    errors: list[EnhancementItemError] = []
+    first_prompt_error: PromptSizeError | None = None
 
     for item_id, answers in answers_by_item.items():
         item = item_details.get(item_id, {})
         if not item:
             continue
 
-        # Find the original questions to include context
-        item_questions = [
-            q for q in analysis_result.get("questions", []) if q.get("item_id") == item_id
-        ]
-
-        # Format answers with their questions for context
+        # Format answers with their questions for context.
+        # In the fast path questions_by_id is empty, so fall back to
+        # question_text carried on the AnswerInput itself.
         answers_text = ""
         for answer in answers:
-            # Find matching question
-            matching_q = next(
-                (q for q in item_questions if q.get("question_id") == answer.question_id),
-                None,
+            matching_q = questions_by_id.get(answer.question_id)
+            question = (
+                matching_q.get("question", "") if matching_q else answer.question_text
             )
-            if matching_q:
-                answers_text += f"Q: {matching_q.get('question', '')}\n"
+            if question:
+                answers_text += f"Q: {question}\n"
                 answers_text += f"A: {answer.answer}\n\n"
             else:
                 answers_text += f"Additional info: {answer.answer}\n\n"
@@ -216,8 +363,8 @@ async def generate_enhancements(request: EnhanceRequest) -> EnhancementPreview:
         # Build enhancement prompt with content language
         current_desc = item.get("current_description", [])
         current_desc_text = "\n".join(f"- {d}" for d in current_desc) if current_desc else "(No description)"
-        
-        language = _get_content_language()
+
+        language = get_content_language()
         output_language = get_language_name(language)
 
         prompt = ENHANCE_DESCRIPTION_PROMPT.format(
@@ -230,12 +377,13 @@ async def generate_enhancements(request: EnhanceRequest) -> EnhancementPreview:
         )
 
         try:
-            result = await complete_json(prompt)
-            # Get additional bullets from LLM (new key name)
-            additional_bullets = result.get("additional_bullets", [])
-            # Fallback to old key for backwards compatibility
-            if not additional_bullets:
-                additional_bullets = result.get("enhanced_description", [])
+            result = await complete_json(
+                prompt,
+                schema_type="diff",
+                response_validator=_validate_enhancement_result,
+            )
+            result = _validate_enhancement_result(result)
+            additional_bullets = result["additional_bullets"]
 
             enhancements.append(
                 EnhancedDescription(
@@ -246,11 +394,36 @@ async def generate_enhancements(request: EnhanceRequest) -> EnhancementPreview:
                     enhanced_description=additional_bullets,  # These are NEW bullets to add
                 )
             )
+        except AIOperationDeadlineExceeded:
+            raise
         except Exception as e:
-            logger.warning(f"Failed to enhance item {item_id}: {e}")
-            # Continue with other items
+            logger.warning("Failed to enhance item %s: %s", item_id, e, exc_info=e)
+            message = "Failed to enhance this item. Please try again."
+            if isinstance(e, PromptSizeError):
+                first_prompt_error = first_prompt_error or e
+                message = "This item is too large to enhance. Shorten its description or answers."
+            errors.append(
+                EnhancementItemError(
+                    item_id=item_id,
+                    item_type=item.get("item_type", "experience"),
+                    title=item.get("title", ""),
+                    subtitle=item.get("subtitle"),
+                    message=message,
+                )
+            )
 
-    return EnhancementPreview(enhancements=enhancements)
+    if answers_by_item and not enhancements:
+        if first_prompt_error is not None:
+            raise first_prompt_error
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to generate enhancements. "
+                "Original resume content was preserved."
+            ),
+        )
+
+    return EnhancementPreview(enhancements=enhancements, errors=errors)
 
 
 @router.post("/apply/{resume_id}")
@@ -263,7 +436,7 @@ async def apply_enhancements(
     the enhanced descriptions.
     """
     # Fetch resume
-    resume = db.get_resume(resume_id)
+    resume = await db.get_resume(resume_id)
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 
@@ -316,13 +489,15 @@ async def apply_enhancements(
     # Update the resume in database
     updated_content = json.dumps(updated_data, indent=2)
     try:
-        db.update_resume(
+        await db.update_resume(
             resume_id,
             {
                 "content": updated_content,
                 "processed_data": updated_data,
             },
         )
+    except DatabaseBusyError:
+        raise
     except Exception as e:
         logger.error(f"Failed to save enhancements to database: {e}")
         raise HTTPException(
@@ -362,7 +537,14 @@ async def _regenerate_experience_or_project(
         user_instruction=instruction,
     )
 
-    result = await complete_json(prompt, max_tokens=4096)
+    result = await complete_json(
+        prompt,
+        max_tokens=4096,
+        schema_type="diff",
+        response_validator=_validate_regenerated_item_result,
+    )
+    result = _validate_regenerated_item_result(result)
+    new_bullets = result["new_bullets"]
 
     return RegeneratedItem(
         item_id=item.item_id,
@@ -370,8 +552,8 @@ async def _regenerate_experience_or_project(
         title=item.title,
         subtitle=item.subtitle,
         original_content=item.current_content,
-        new_content=result.get("new_bullets", []),
-        diff_summary=result.get("change_summary", ""),
+        new_content=new_bullets,
+        diff_summary=str(result.get("change_summary") or ""),
     )
 
 
@@ -389,7 +571,14 @@ async def _regenerate_skills(
         user_instruction=instruction,
     )
 
-    result = await complete_json(prompt, max_tokens=2048)
+    result = await complete_json(
+        prompt,
+        max_tokens=2048,
+        schema_type="diff",
+        response_validator=_validate_regenerated_skills_result,
+    )
+    result = _validate_regenerated_skills_result(result)
+    new_skills = result["new_skills"]
 
     return RegeneratedItem(
         item_id=item.item_id,
@@ -397,8 +586,8 @@ async def _regenerate_skills(
         title=item.title,
         subtitle=item.subtitle,
         original_content=item.current_content,
-        new_content=result.get("new_skills", []),
-        diff_summary=result.get("change_summary", ""),
+        new_content=new_skills,
+        diff_summary=str(result.get("change_summary") or ""),
     )
 
 
@@ -410,7 +599,7 @@ async def regenerate_items(request: RegenerateRequest) -> RegenerateResponse:
     then uses AI to rewrite the content addressing the user's concerns.
     """
     # Validate resume exists
-    resume = db.get_resume(request.resume_id)
+    resume = await db.get_resume(request.resume_id)
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 
@@ -420,20 +609,32 @@ async def regenerate_items(request: RegenerateRequest) -> RegenerateResponse:
     # Get language name for LLM
     output_language = get_language_name(request.output_language)
 
-    # Process all items in parallel for better performance
-    tasks = []
-    for item in request.items:
-        if item.item_type == "skills":
-            tasks.append(_regenerate_skills(item, request.instruction, output_language))
-        else:
-            tasks.append(_regenerate_experience_or_project(item, request.instruction, output_language))
+    # A bounded collection may queue work, but at most four items call AI.
+    semaphore = asyncio.Semaphore(MAX_ITEM_WORKERS)
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    async def regenerate_one(item: RegenerateItemInput) -> RegeneratedItem:
+        async with semaphore:
+            if item.item_type == "skills":
+                return await _regenerate_skills(
+                    item, request.instruction, output_language
+                )
+            return await _regenerate_experience_or_project(
+                item, request.instruction, output_language
+            )
+
+    results = await asyncio.gather(
+        *(regenerate_one(item) for item in request.items), return_exceptions=True
+    )
 
     regenerated_items: list[RegeneratedItem] = []
     errors: list[RegenerateItemError] = []
 
     for item, result in zip(request.items, results):
+        if isinstance(
+            result,
+            (asyncio.CancelledError, AIOperationDeadlineExceeded, PromptSizeError),
+        ):
+            raise result
         if isinstance(result, Exception):
             logger.error(
                 "Failed to regenerate item. "
@@ -472,7 +673,7 @@ async def apply_regenerated_items(
     the regenerated descriptions.
     """
     # Fetch resume
-    resume = db.get_resume(resume_id)
+    resume = await db.get_resume(resume_id)
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
 
@@ -707,13 +908,15 @@ async def apply_regenerated_items(
     # Update the resume in database
     updated_content = json.dumps(updated_data, indent=2)
     try:
-        db.update_resume(
+        await db.update_resume(
             resume_id,
             {
                 "content": updated_content,
                 "processed_data": updated_data,
             },
         )
+    except DatabaseBusyError:
+        raise
     except Exception as e:
         logger.error(f"Failed to save regenerated content to database: {e}")
         raise HTTPException(

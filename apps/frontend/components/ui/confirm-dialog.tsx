@@ -31,6 +31,7 @@ export interface ConfirmDialogProps {
   confirmLabel?: string;
   cancelLabel?: string;
   confirmDisabled?: boolean;
+  cancelDisabled?: boolean;
   variant?: 'danger' | 'warning' | 'success' | 'default';
   closeOnConfirm?: boolean;
   onConfirm: () => void;
@@ -47,6 +48,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
   confirmLabel,
   cancelLabel,
   confirmDisabled = false,
+  cancelDisabled = false,
   variant = 'default',
   closeOnConfirm = true,
   onConfirm,
@@ -66,6 +68,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
   };
 
   const handleCancel = () => {
+    if (cancelDisabled) return;
     onCancel?.();
     onOpenChange(false);
   };
@@ -108,16 +111,22 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
   const { icon, buttonVariant } = variantStyles[variant];
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && cancelDisabled) return;
+        onOpenChange(nextOpen);
+      }}
+    >
       <DialogContent className="sm:max-w-[425px] p-0 gap-0">
         <DialogHeader className="p-6 pb-4">
           <div className="flex items-start gap-4">
             {icon}
-            <div className="flex-1">
+            <div className="min-w-0 flex-1">
               <DialogTitle className="font-serif text-xl font-bold uppercase tracking-tight">
                 {title}
               </DialogTitle>
-              <DialogDescription className="font-mono text-xs text-gray-600 mt-2">
+              <DialogDescription className="font-mono text-xs text-ink-soft mt-2 max-h-60 overflow-y-auto whitespace-pre-wrap [overflow-wrap:anywhere]">
                 {description}
               </DialogDescription>
             </div>
@@ -125,14 +134,19 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
         </DialogHeader>
         {errorMessage && (
           <div className="px-6 pb-4">
-            <div className="border-2 border-red-600 bg-red-50 p-3 font-mono text-xs text-red-700">
+            <div className="border-2 border-red-600 bg-red-50 p-3 font-mono text-xs text-red-700 max-h-60 overflow-y-auto whitespace-pre-wrap [overflow-wrap:anywhere]">
               {errorMessage}
             </div>
           </div>
         )}
-        <DialogFooter className="p-4 bg-[#E5E5E0] border-t border-black flex-row justify-end gap-3">
+        <DialogFooter className="p-4 bg-secondary border-t border-black flex-row justify-end gap-3">
           {showCancelButton && (
-            <Button variant="outline" onClick={handleCancel} className="rounded-none border-black">
+            <Button
+              variant="outline"
+              onClick={handleCancel}
+              disabled={cancelDisabled}
+              className="rounded-none border-black"
+            >
               {finalCancelLabel}
             </Button>
           )}

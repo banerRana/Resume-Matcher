@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -21,7 +21,8 @@ import {
 import { useFileUpload, formatBytes } from '@/hooks/use-file-upload';
 import { getUploadUrl } from '@/lib/api/client';
 import { useTranslations } from '@/lib/i18n';
-import { retryProcessing } from '@/lib/api/resume';
+import { deleteResume, retryProcessing } from '@/lib/api/resume';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 
 interface ResumeUploadDialogProps {
   trigger?: React.ReactNode;
@@ -46,11 +47,17 @@ export function ResumeUploadDialog({
   const { t } = useTranslations();
   const [internalOpen, setInternalOpen] = useState(false);
   const [uploadFeedback, setUploadFeedback] = useState<{
-    type: 'success' | 'error';
+    type: 'success' | 'error' | 'pending';
     message: string;
   } | null>(null);
   const [failedResumeId, setFailedResumeId] = useState<string | null>(null);
+  const [failedIsMaster, setFailedIsMaster] = useState(false);
   const [isRetryingProcessing, setIsRetryingProcessing] = useState(false);
+  const [isDeletingResume, setIsDeletingResume] = useState(false);
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const recoveryOwnerRef = useRef(0);
+  const recoveryBusyRef = useRef(false);
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isControlled = controlledOpen !== undefined;
   const isOpen = isControlled ? controlledOpen : internalOpen;
   const setIsOpen = (nextOpen: boolean) => {
@@ -61,6 +68,22 @@ export function ResumeUploadDialog({
   };
 
   const UPLOAD_URL = getUploadUrl();
+
+  const clearScheduledClose = useCallback(() => {
+    if (closeTimerRef.current !== null) {
+      clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  }, []);
+
+  useLayoutEffect(
+    () => () => {
+      recoveryOwnerRef.current += 1;
+      recoveryBusyRef.current = false;
+      clearScheduledClose();
+    },
+    [clearScheduledClose]
+  );
 
   const handleUploadSuccess = ({
     resumeId,
@@ -74,13 +97,10 @@ export function ResumeUploadDialog({
     setUploadFeedback({ type: 'success', message });
     setFailedResumeId(null);
 
-    // Defer parent state update to avoid setState during render
-    setTimeout(() => {
-      onUploadComplete?.(resumeId);
-    }, 0);
-
     // Close dialog after a short delay to show success state
-    setTimeout(() => {
+    clearScheduledClose();
+    closeTimerRef.current = setTimeout(() => {
+      closeTimerRef.current = null;
       setIsOpen(false);
       setUploadFeedback(null);
       setFailedResumeId(null);
@@ -88,6 +108,7 @@ export function ResumeUploadDialog({
         removeFile(fileId); // Clear file for next time
       }
     }, 1500);
+    onUploadComplete?.(resumeId);
   };
 
   const [
@@ -96,6 +117,7 @@ export function ResumeUploadDialog({
       getInputProps,
       openFileDialog,
       removeFile,
+      clearFiles,
       handleDragEnter,
       handleDragLeave,
       handleDragOver,
@@ -124,6 +146,7 @@ export function ResumeUploadDialog({
             message: t('dashboard.uploadDialog.parsingFailedKeepOpen'),
           });
           setFailedResumeId(data.resume_id);
+          setFailedIsMaster(data.is_master === true);
           return;
         }
         handleUploadSuccess({
@@ -139,14 +162,21 @@ export function ResumeUploadDialog({
         });
       }
     },
-    onUploadError: (file, errorMsg) => {
-      setFailedResumeId(null);
+    onUploadError: (_file, errorMsg, metadata) => {
+      setFailedResumeId(metadata?.resume_id ?? null);
+      setFailedIsMaster(metadata?.is_master ?? false);
       setUploadFeedback({
         type: 'error',
         message: errorMsg || t('dashboard.uploadDialog.failed'),
       });
     },
     onFilesChange: (currentFiles) => {
+      recoveryOwnerRef.current += 1;
+      recoveryBusyRef.current = false;
+      setIsRetryingProcessing(false);
+      setIsDeletingResume(false);
+      setShowDeleteDialog(false);
+      clearScheduledClose();
       if (currentFiles.length === 0) {
         setUploadFeedback(null);
         setFailedResumeId(null);
@@ -154,7 +184,30 @@ export function ResumeUploadDialog({
     },
   });
 
+  const clearFilesRef = useRef(clearFiles);
+  const wasOpenRef = useRef(isOpen);
+
+  useEffect(() => {
+    clearFilesRef.current = clearFiles;
+  }, [clearFiles]);
+
+  useLayoutEffect(() => {
+    if (wasOpenRef.current && !isOpen) {
+      recoveryOwnerRef.current += 1;
+      recoveryBusyRef.current = false;
+      setIsRetryingProcessing(false);
+      setIsDeletingResume(false);
+      setShowDeleteDialog(false);
+      clearScheduledClose();
+      clearFilesRef.current();
+      setUploadFeedback(null);
+      setFailedResumeId(null);
+    }
+    wasOpenRef.current = isOpen;
+  }, [clearScheduledClose, isOpen]);
+
   const currentFile = files[0];
+  const isRecovering = isRetryingProcessing || isDeletingResume;
   const displayErrors = uploadFeedback?.type === 'error' ? [uploadFeedback.message] : errors;
   const preventDropzoneInteraction = (e: React.DragEvent<HTMLElement>) => {
     e.preventDefault();
@@ -162,14 +215,21 @@ export function ResumeUploadDialog({
   };
 
   const handleRetryProcessing = async () => {
-    if (!failedResumeId) return;
+    if (!failedResumeId || recoveryBusyRef.current) return;
+    const owner = ++recoveryOwnerRef.current;
+    recoveryBusyRef.current = true;
     const resumeIdToRetry = failedResumeId;
     const fileIdToRemove = currentFile?.id;
     setIsRetryingProcessing(true);
     try {
       const result = await retryProcessing(resumeIdToRetry);
+      if (owner !== recoveryOwnerRef.current) return;
       if (result.processing_status !== 'ready') {
-        setUploadFeedback({ type: 'error', message: t('dashboard.retryFailed') });
+        setUploadFeedback(
+          result.processing_status === 'failed'
+            ? { type: 'error', message: t('dashboard.retryFailed') }
+            : { type: 'pending', message: t(`dashboard.status.${result.processing_status}`) }
+        );
         return;
       }
 
@@ -179,10 +239,48 @@ export function ResumeUploadDialog({
         message: t('dashboard.retrySuccess'),
       });
     } catch (err) {
+      if (owner !== recoveryOwnerRef.current) return;
       console.error('Retry processing failed:', err);
+      if (err instanceof Error && err.message.includes('status 404')) {
+        clearFiles();
+        setFailedResumeId(null);
+        setUploadFeedback({ type: 'error', message: t('common.resumeDeleted') });
+        return;
+      }
       setUploadFeedback({ type: 'error', message: t('dashboard.retryFailed') });
     } finally {
-      setIsRetryingProcessing(false);
+      if (owner === recoveryOwnerRef.current) {
+        recoveryBusyRef.current = false;
+        setIsRetryingProcessing(false);
+      }
+    }
+  };
+
+  const handleDeleteSavedUpload = async () => {
+    if (!failedResumeId || recoveryBusyRef.current) return;
+    const owner = ++recoveryOwnerRef.current;
+    recoveryBusyRef.current = true;
+    const resumeIdToDelete = failedResumeId;
+    setIsDeletingResume(true);
+    try {
+      await deleteResume(resumeIdToDelete);
+      if (owner !== recoveryOwnerRef.current) return;
+      clearFiles();
+      setUploadFeedback({ type: 'error', message: t('common.resumeDeleted') });
+    } catch (err) {
+      if (owner !== recoveryOwnerRef.current) return;
+      console.error('Failed to delete saved upload:', err);
+      if (err instanceof Error && err.message.includes('status 404')) {
+        clearFiles();
+        setUploadFeedback({ type: 'error', message: t('common.resumeDeleted') });
+        return;
+      }
+      setUploadFeedback({ type: 'error', message: t('dashboard.errors.deleteFailed') });
+    } finally {
+      if (owner === recoveryOwnerRef.current) {
+        recoveryBusyRef.current = false;
+        setIsDeletingResume(false);
+      }
     }
   };
 
@@ -190,33 +288,33 @@ export function ResumeUploadDialog({
     <Dialog open={isOpen} onOpenChange={setIsOpen}>
       <DialogTrigger asChild>
         {trigger || (
-          <Button className="rounded-none border border-black shadow-[4px_4px_0px_0px_rgba(0,0,0,0.1)] hover:translate-y-[1px] hover:translate-x-[1px] hover:shadow-none transition-all">
+          <Button className="rounded-none border border-black shadow-sw-default hover:translate-y-[1px] hover:translate-x-[1px] hover:shadow-none transition-all">
             <UploadIcon className="w-4 h-4 mr-2" />
             {t('dashboard.uploadResume')}
           </Button>
         )}
       </DialogTrigger>
-      <DialogContent className="sm:max-w-md bg-[#F0F0E8] border border-black shadow-[8px_8px_0px_0px_rgba(0,0,0,0.2)] p-0 gap-0 rounded-none">
+      <DialogContent className="sm:max-w-md bg-background border border-black shadow-sw-lg p-0 gap-0 rounded-none">
         <DialogHeader className="p-6 border-b border-black bg-white">
           <DialogTitle className="font-serif text-2xl font-bold uppercase tracking-tight">
             {t('dashboard.uploadResume')}
           </DialogTitle>
         </DialogHeader>
 
-        <div className="p-6 bg-[#F0F0E8]">
+        <div className="p-6 bg-background">
           <div
             className={`
                             relative border-2 border-dashed p-8 text-center transition-all duration-200
-                            ${isDragging ? 'border-blue-700 bg-blue-50' : 'border-gray-400 hover:border-black hover:bg-white'}
+                            ${isDragging ? 'border-blue-700 bg-blue-50' : 'border-steel-grey hover:border-black hover:bg-white'}
                             ${currentFile ? 'bg-white border-solid border-black' : ''}
-                            ${!currentFile && !isRetryingProcessing ? 'cursor-pointer' : 'cursor-default'}
-                            ${isRetryingProcessing ? 'opacity-70' : ''}
+                            ${!currentFile && !isRecovering ? 'cursor-pointer' : 'cursor-default'}
+                            ${isRecovering ? 'opacity-70' : ''}
                         `}
-            onClick={!currentFile && !isRetryingProcessing ? openFileDialog : undefined}
-            onDragEnter={isRetryingProcessing ? preventDropzoneInteraction : handleDragEnter}
-            onDragLeave={isRetryingProcessing ? preventDropzoneInteraction : handleDragLeave}
-            onDragOver={isRetryingProcessing ? preventDropzoneInteraction : handleDragOver}
-            onDrop={isRetryingProcessing ? preventDropzoneInteraction : handleDrop}
+            onClick={!currentFile && !isRecovering ? openFileDialog : undefined}
+            onDragEnter={isRecovering ? preventDropzoneInteraction : handleDragEnter}
+            onDragLeave={isRecovering ? preventDropzoneInteraction : handleDragLeave}
+            onDragOver={isRecovering ? preventDropzoneInteraction : handleDragOver}
+            onDrop={isRecovering ? preventDropzoneInteraction : handleDrop}
           >
             <input {...getInputProps()} />
 
@@ -230,14 +328,14 @@ export function ResumeUploadDialog({
             ) : currentFile ? (
               <div className="flex items-center justify-between gap-4">
                 <div className="flex items-center gap-3 text-left overflow-hidden">
-                  <div className="w-10 h-10 border border-black bg-gray-100 flex items-center justify-center shrink-0">
+                  <div className="w-10 h-10 border border-black bg-paper-tint flex items-center justify-center shrink-0">
                     <FileIcon className="w-5 h-5 text-black" />
                   </div>
                   <div className="min-w-0">
                     <p className="font-bold text-sm truncate max-w-[200px]">
                       {currentFile.file.name}
                     </p>
-                    <p className="font-mono text-xs text-gray-500">
+                    <p className="font-mono text-xs text-steel-grey">
                       {formatBytes(currentFile.file.size)}
                     </p>
                   </div>
@@ -245,25 +343,27 @@ export function ResumeUploadDialog({
                 <Button
                   variant="ghost"
                   size="icon"
-                  disabled={isRetryingProcessing}
+                  disabled={isRecovering}
                   onClick={(e) => {
                     e.stopPropagation();
                     removeFile(currentFile.id);
                   }}
                   className="hover:bg-red-100 text-red-600 rounded-none"
+                  aria-label={t('a11y.removeFile')}
+                  title={t('a11y.removeFile')}
                 >
                   <XIcon className="w-5 h-5" />
                 </Button>
               </div>
             ) : (
               <div className="flex flex-col items-center py-4">
-                <div className="w-12 h-12 border border-black bg-white shadow-[4px_4px_0px_0px_rgba(0,0,0,0.1)] flex items-center justify-center mb-4">
+                <div className="w-12 h-12 border border-black bg-white shadow-sw-default flex items-center justify-center mb-4">
                   <UploadIcon className="w-6 h-6 text-black" />
                 </div>
                 <p className="font-bold text-lg mb-1">
                   {t('dashboard.uploadDialog.dropzoneTitle')}
                 </p>
-                <p className="font-mono text-xs text-gray-500 uppercase">
+                <p className="font-mono text-xs text-steel-grey uppercase">
                   {t('dashboard.uploadDialog.dropzoneSubtitle')}
                 </p>
               </div>
@@ -282,6 +382,12 @@ export function ResumeUploadDialog({
             </div>
           )}
 
+          {uploadFeedback?.type === 'pending' && (
+            <p role="status" className="mt-4 border border-black p-3 font-mono text-sm">
+              {uploadFeedback.message}
+            </p>
+          )}
+
           {uploadFeedback?.type === 'success' && (
             <div className="mt-4 p-3 bg-green-50 border border-green-200 flex items-center gap-2 text-green-700 text-sm font-bold">
               <CheckCircle2Icon className="w-5 h-5 shrink-0" />
@@ -290,24 +396,33 @@ export function ResumeUploadDialog({
           )}
         </div>
 
-        <div className="p-4 border-t border-black bg-white flex justify-end gap-2">
-          {uploadFeedback?.type === 'error' && failedResumeId && (
+        <div className="p-4 border-t border-black bg-white flex flex-wrap justify-end gap-2">
+          {failedResumeId && uploadFeedback?.type !== 'success' && (
             <Button
               variant="outline"
-              className="rounded-none border-black hover:bg-gray-100"
+              className="rounded-none border-black hover:bg-paper-tint"
               onClick={handleRetryProcessing}
-              disabled={isRetryingProcessing}
+              disabled={isRecovering}
             >
               {isRetryingProcessing
                 ? t('dashboard.retryingProcessing')
                 : t('dashboard.retryProcessing')}
             </Button>
           )}
+          {failedResumeId && uploadFeedback?.type !== 'success' && (
+            <Button
+              variant="destructive"
+              disabled={isRecovering}
+              onClick={() => setShowDeleteDialog(true)}
+            >
+              {t('dashboard.deleteResume')}
+            </Button>
+          )}
           {uploadFeedback?.type === 'error' && files.length > 0 && (
             <Button
               variant="outline"
-              className="rounded-none border-black hover:bg-gray-100"
-              disabled={isRetryingProcessing}
+              className="rounded-none border-black hover:bg-paper-tint"
+              disabled={isRecovering}
               onClick={() => {
                 if (files[0]) removeFile(files[0].id);
                 setUploadFeedback(null);
@@ -318,12 +433,28 @@ export function ResumeUploadDialog({
             </Button>
           )}
           <DialogClose asChild>
-            <Button variant="outline" className="rounded-none border-black hover:bg-gray-100">
+            <Button variant="outline" className="rounded-none border-black hover:bg-paper-tint">
               {t('common.cancel')}
             </Button>
           </DialogClose>
         </div>
       </DialogContent>
+      <ConfirmDialog
+        open={isOpen && showDeleteDialog}
+        onOpenChange={setShowDeleteDialog}
+        title={t(
+          failedIsMaster ? 'confirmations.deleteMasterResumeTitle' : 'confirmations.deleteResume'
+        )}
+        description={t(
+          failedIsMaster
+            ? 'confirmations.deleteMasterResumeDescription'
+            : 'confirmations.deleteResumeDescription'
+        )}
+        confirmLabel={t('confirmations.deleteResumeConfirmLabel')}
+        confirmDisabled={isRecovering}
+        onConfirm={handleDeleteSavedUpload}
+        variant="danger"
+      />
     </Dialog>
   );
 }

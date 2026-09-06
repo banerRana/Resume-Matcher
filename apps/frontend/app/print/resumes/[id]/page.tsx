@@ -130,11 +130,15 @@ function parseMargin(value: string | undefined, defaultValue: number): number {
  * Validate template type
  */
 function parseTemplate(value: string | undefined): TemplateType {
+  // Allow-list mirrors TEMPLATE_OPTIONS in lib/types/template-settings.ts — keep in sync.
   if (
     value === 'swiss-single' ||
     value === 'swiss-two-column' ||
     value === 'modern' ||
-    value === 'modern-two-column'
+    value === 'modern-two-column' ||
+    value === 'latex' ||
+    value === 'clean' ||
+    value === 'vivid'
   ) {
     return value;
   }
@@ -243,11 +247,14 @@ export default async function PrintResumePage({ params, searchParams }: PageProp
   };
 
   return (
-    <div className="resume-print bg-white">
+    // `lang` also drives Chromium's own font fallback during PDF render, which
+    // matters for the CJK faces (L-08).
+    <div className="resume-print bg-white" lang={locale}>
       <Resume
         resumeData={localizedResumeData}
         template={settings.template}
         settings={printSettings}
+        locale={locale}
         additionalSectionLabels={additionalSectionLabels}
         sectionHeadings={sectionHeadings}
         fallbackLabels={fallbackLabels}

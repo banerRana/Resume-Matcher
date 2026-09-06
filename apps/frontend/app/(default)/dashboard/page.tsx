@@ -2,7 +2,8 @@
 
 import { SwissGrid } from '@/components/home/swiss-grid';
 import { ResumeUploadDialog } from '@/components/dashboard/resume-upload-dialog';
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { MasterResumeChoiceDialog } from '@/components/dashboard/master-resume-choice-dialog';
+import { useState, useEffect, useCallback, useRef, type KeyboardEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -27,6 +28,7 @@ import {
   type ResumeListItem,
 } from '@/lib/api/resume';
 import { useStatusCache } from '@/lib/context/status-cache';
+import { hasMeaningfulResumeContent } from '@/lib/utils/resume-content';
 
 type ProcessingStatus = 'pending' | 'processing' | 'ready' | 'failed' | 'loading';
 
@@ -35,9 +37,12 @@ export default function DashboardPage() {
   const [masterResumeId, setMasterResumeId] = useState<string | null>(null);
   const [processingStatus, setProcessingStatus] = useState<ProcessingStatus>('loading');
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [listError, setListError] = useState(false);
+  const [deleteError, setDeleteError] = useState(false);
   const [tailoredResumes, setTailoredResumes] = useState<ResumeListItem[]>([]);
   const [isRetrying, setIsRetrying] = useState(false);
   const [isUploadDialogOpen, setIsUploadDialogOpen] = useState(false);
+  const [isMasterChoiceDialogOpen, setIsMasterChoiceDialogOpen] = useState(false);
   const router = useRouter();
 
   // Status cache for optimistic counter updates and LLM status check
@@ -51,6 +56,12 @@ export default function DashboardPage() {
 
   // Request id guard for concurrent loadTailoredResumes invocations
   const loadRequestIdRef = useRef(0);
+  const statusRequestIdRef = useRef(0);
+  const retryMasterRef = useRef<string | null>(null);
+  const pollAttemptsRef = useRef(0);
+  const [statusRevision, setStatusRevision] = useState(0);
+  const activeMasterIdRef = useRef<string | null>(null);
+  const mountedRef = useRef(true);
   // Lightweight in-memory cache for job snippets to avoid N+1 refetches
   const jobSnippetCacheRef = useRef<Record<string, string>>({});
 
@@ -65,56 +76,124 @@ export default function DashboardPage() {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return t('common.unknown');
 
-    const dateLocale =
-      locale === 'es' ? 'es-ES' : locale === 'zh' ? 'zh-CN' : locale === 'ja' ? 'ja-JP' : 'en-US';
-
-    return date.toLocaleDateString(dateLocale, {
+    // Intl resolves plain language tags itself; the old ternary silently sent
+    // ko/fr/pt to en-US. Every other call site already passes `locale` directly.
+    return date.toLocaleDateString(locale, {
       month: 'short',
       day: '2-digit',
       year: 'numeric',
     });
   };
 
-  const checkResumeStatus = useCallback(async (resumeId: string) => {
-    try {
-      setProcessingStatus('loading');
-      const data = await fetchResume(resumeId);
-      const status = data.raw_resume?.processing_status || 'pending';
-      setProcessingStatus(status as ProcessingStatus);
-    } catch (err: unknown) {
-      console.error('Failed to check resume status:', err);
-      // If resume not found (404), clear the stale localStorage
-      if (err instanceof Error && err.message.includes('404')) {
-        localStorage.removeItem('master_resume_id');
-        setMasterResumeId(null);
-        return;
-      }
-      setProcessingStatus('failed');
+  const adoptMasterResume = useCallback((resumeId: string | null) => {
+    if (activeMasterIdRef.current !== resumeId) {
+      statusRequestIdRef.current += 1;
+      retryMasterRef.current = null;
+      pollAttemptsRef.current = 0;
+      setIsRetrying(false);
     }
+    activeMasterIdRef.current = resumeId;
+    setMasterResumeId(resumeId);
   }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      loadRequestIdRef.current += 1;
+      statusRequestIdRef.current += 1;
+    };
+  }, []);
+
+  const checkResumeStatus = useCallback(
+    async (resumeId: string, background = false) => {
+      if (
+        !mountedRef.current ||
+        activeMasterIdRef.current !== resumeId ||
+        retryMasterRef.current === resumeId
+      )
+        return;
+      if (!background) pollAttemptsRef.current = 0;
+      const requestId = ++statusRequestIdRef.current;
+      const isCurrent = () =>
+        mountedRef.current &&
+        requestId === statusRequestIdRef.current &&
+        activeMasterIdRef.current === resumeId;
+      try {
+        if (!background) setProcessingStatus('loading');
+        const data = await fetchResume(resumeId);
+        if (!isCurrent()) return;
+        const savedStatus = data.raw_resume?.processing_status || 'pending';
+        // Older backend versions accepted `{}` as a valid ResumeData object.
+        // Surface that legacy state as failed so users can retry it safely.
+        const status =
+          savedStatus === 'ready' && !hasMeaningfulResumeContent(data.processed_resume)
+            ? 'failed'
+            : savedStatus;
+        setProcessingStatus(status as ProcessingStatus);
+      } catch (err: unknown) {
+        if (!isCurrent()) return;
+        console.error('Failed to check resume status:', err);
+        // If resume not found (404), clear the stale localStorage
+        if (err instanceof Error && err.message.includes('404')) {
+          localStorage.removeItem('master_resume_id');
+          adoptMasterResume(null);
+          return;
+        }
+        setProcessingStatus('failed');
+      } finally {
+        if (isCurrent()) setStatusRevision((version) => version + 1);
+      }
+    },
+    [adoptMasterResume]
+  );
 
   useEffect(() => {
     const storedId = localStorage.getItem('master_resume_id');
     if (storedId) {
-      setMasterResumeId(storedId);
+      adoptMasterResume(storedId);
       checkResumeStatus(storedId);
     }
-  }, [checkResumeStatus]);
+  }, [adoptMasterResume, checkResumeStatus]);
+
+  // A bounded backoff preserves the processing label and never overlaps requests.
+  // Focus or an explicit refresh starts a fresh observation window.
+  useEffect(() => {
+    if (
+      !masterResumeId ||
+      isRetrying ||
+      !['pending', 'processing'].includes(processingStatus) ||
+      pollAttemptsRef.current >= 12
+    )
+      return;
+    const requestId = statusRequestIdRef.current;
+    const delay = Math.min(30_000, 3_000 * 2 ** pollAttemptsRef.current);
+    const timer = window.setTimeout(() => {
+      if (requestId !== statusRequestIdRef.current || document.hidden) return;
+      pollAttemptsRef.current += 1;
+      void checkResumeStatus(masterResumeId, true);
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [masterResumeId, processingStatus, isRetrying, statusRevision, checkResumeStatus]);
 
   const loadTailoredResumes = useCallback(async () => {
+    const requestId = ++loadRequestIdRef.current;
+    const isCurrent = () => mountedRef.current && requestId === loadRequestIdRef.current;
     try {
+      setListError(false);
       const data = await fetchResumeList(true);
+      if (!isCurrent()) return;
       const masterFromList = data.find((r) => r.is_master);
       const storedId = localStorage.getItem('master_resume_id');
       const resolvedMasterId = masterFromList?.resume_id || storedId;
 
       if (resolvedMasterId) {
         localStorage.setItem('master_resume_id', resolvedMasterId);
-        setMasterResumeId(resolvedMasterId);
+        adoptMasterResume(resolvedMasterId);
         checkResumeStatus(resolvedMasterId);
       } else {
         localStorage.removeItem('master_resume_id');
-        setMasterResumeId(null);
+        adoptMasterResume(null);
       }
 
       const filtered = data.filter((r) => r.resume_id !== resolvedMasterId);
@@ -124,9 +203,6 @@ export default function DashboardPage() {
       // (identified by having a non-null parent_id). This avoids N+1 calls
       // for untailored resumes.
       const tailoredWithParent = filtered.filter((r) => r.parent_id);
-
-      // Guard against concurrent invocations overwriting each other
-      const requestId = ++loadRequestIdRef.current;
 
       // Fetch job description snippets for tailored resumes in parallel and attach to state
       // Use a small in-memory cache to avoid re-fetching the same snippet repeatedly.
@@ -141,26 +217,28 @@ export default function DashboardPage() {
           try {
             const jd = await fetchJobDescription(r.resume_id);
             const snippet = (jd?.content || '').slice(0, 80);
-            jobSnippetCacheRef.current[r.resume_id] = snippet;
+            if (isCurrent()) jobSnippetCacheRef.current[r.resume_id] = snippet;
             jobSnippets[r.resume_id] = snippet;
           } catch {
             // ignore missing job descriptions and cache empty result
-            jobSnippetCacheRef.current[r.resume_id] = '';
+            if (isCurrent()) jobSnippetCacheRef.current[r.resume_id] = '';
             jobSnippets[r.resume_id] = '';
           }
         })
       );
 
       // Only apply results if this invocation is the latest (prevents stale overwrite)
-      if (requestId === loadRequestIdRef.current) {
+      if (isCurrent()) {
         setTailoredResumes((prev) =>
           prev.map((r) => ({ ...r, jobSnippet: jobSnippets[r.resume_id] || '' }))
         );
       }
     } catch (err) {
+      if (!isCurrent()) return;
       console.error('Failed to load tailored resumes:', err);
+      setListError(true);
     }
-  }, [checkResumeStatus]);
+  }, [adoptMasterResume, checkResumeStatus]);
 
   useEffect(() => {
     loadTailoredResumes();
@@ -176,8 +254,10 @@ export default function DashboardPage() {
   }, [loadTailoredResumes, checkResumeStatus]);
 
   const handleUploadComplete = (resumeId: string) => {
+    loadRequestIdRef.current += 1;
+    void loadTailoredResumes();
     localStorage.setItem('master_resume_id', resumeId);
-    setMasterResumeId(resumeId);
+    adoptMasterResume(resumeId);
     // Check status after upload completes
     checkResumeStatus(resumeId);
     // Update cached counters
@@ -185,27 +265,64 @@ export default function DashboardPage() {
     setHasMasterResume(true);
   };
 
+  const handleChooseUpload = () => {
+    setIsMasterChoiceDialogOpen(false);
+    setIsUploadDialogOpen(true);
+  };
+
+  const handleChooseWizard = () => {
+    setIsMasterChoiceDialogOpen(false);
+    router.push('/resume-wizard');
+  };
+
+  const handleInitializeMasterKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      setIsMasterChoiceDialogOpen(true);
+    }
+  };
+
   const handleRetryProcessing = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!masterResumeId) return;
+    if (!masterResumeId || retryMasterRef.current === masterResumeId) return;
+    const resumeId = masterResumeId;
+    retryMasterRef.current = resumeId;
+    const requestId = ++statusRequestIdRef.current;
+    const isCurrent = () =>
+      mountedRef.current &&
+      requestId === statusRequestIdRef.current &&
+      activeMasterIdRef.current === resumeId;
     setIsRetrying(true);
+    setProcessingStatus('loading');
     try {
-      const result = await retryProcessing(masterResumeId);
+      const result = await retryProcessing(resumeId);
+      if (!isCurrent()) return;
       if (result.processing_status === 'ready') {
         setProcessingStatus('ready');
       } else if (
         result.processing_status === 'processing' ||
         result.processing_status === 'pending'
       ) {
+        pollAttemptsRef.current = 0;
         setProcessingStatus(result.processing_status);
       } else {
         setProcessingStatus('failed');
       }
     } catch (err) {
+      if (!isCurrent()) return;
       console.error('Retry processing failed:', err);
+      if (err instanceof Error && err.message.includes('status 404')) {
+        localStorage.removeItem('master_resume_id');
+        adoptMasterResume(null);
+        setHasMasterResume(false);
+        return;
+      }
       setProcessingStatus('failed');
     } finally {
-      setIsRetrying(false);
+      if (isCurrent()) {
+        retryMasterRef.current = null;
+        setIsRetrying(false);
+      }
     }
   };
 
@@ -216,17 +333,24 @@ export default function DashboardPage() {
 
   const confirmDeleteAndReupload = async () => {
     if (!masterResumeId) return;
+    const resumeId = masterResumeId;
+    loadRequestIdRef.current += 1;
     try {
-      await deleteResume(masterResumeId);
+      setDeleteError(false);
+      await deleteResume(resumeId);
+      if (!mountedRef.current || activeMasterIdRef.current !== resumeId) return;
       decrementResumes();
       setHasMasterResume(false);
       localStorage.removeItem('master_resume_id');
-      setMasterResumeId(null);
+      adoptMasterResume(null);
       setProcessingStatus('loading');
       setIsUploadDialogOpen(true);
       await loadTailoredResumes();
     } catch (err) {
+      if (!mountedRef.current || activeMasterIdRef.current !== resumeId) return;
       console.error('Failed to delete resume:', err);
+      setShowDeleteDialog(false);
+      setDeleteError(true);
     }
   };
 
@@ -236,7 +360,7 @@ export default function DashboardPage() {
         return {
           text: t('dashboard.status.checking'),
           icon: <Loader2 className="w-3 h-3 animate-spin" />,
-          color: 'text-gray-500',
+          color: 'text-steel-grey',
         };
       case 'processing':
         return {
@@ -253,7 +377,7 @@ export default function DashboardPage() {
           color: 'text-red-600',
         };
       default:
-        return { text: t('dashboard.status.pending'), icon: null, color: 'text-gray-500' };
+        return { text: t('dashboard.status.pending'), icon: null, color: 'text-steel-grey' };
     }
   };
 
@@ -291,10 +415,32 @@ export default function DashboardPage() {
   const extraFillerCount = 5;
   // Use Tailwind classes for fillers now that we have them in config or use specific hex if needed
   // Using the hex values from before to maintain exact look, or we could map them to variants
-  const fillerPalette = ['bg-[#E5E5E0]', 'bg-[#D8D8D2]', 'bg-[#CFCFC7]', 'bg-[#E0E0D8]'];
+  const fillerPalette = ['bg-secondary', 'bg-[#D8D8D2]', 'bg-[#CFCFC7]', 'bg-[#E0E0D8]'];
+
+  const listErrorAlert = listError ? (
+    <div
+      role="alert"
+      className="m-6 rounded-none border-2 border-red-600 bg-red-100 p-6 shadow-sw-default"
+    >
+      <div className="flex items-start gap-3">
+        <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-600" />
+        <div>
+          <p className="font-mono text-sm font-bold uppercase text-red-600">
+            {t('dashboard.errors.loadFailed')}
+          </p>
+          <Button className="mt-4" variant="outline" onClick={loadTailoredResumes}>
+            <RefreshCw className="h-4 w-4" />
+            {t('common.retry')}
+          </Button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+  if (listError && !masterResumeId && tailoredResumes.length === 0) return listErrorAlert;
 
   return (
     <div className="space-y-6">
+      {listErrorAlert}
       {/* Configuration Warning Banner */}
       {masterResumeId && !isLlmConfigured && !statusLoading && (
         <div className="border-2 border-warning bg-amber-50 p-4 shadow-sw-default mb-6 flex items-center justify-between">
@@ -350,32 +496,46 @@ export default function DashboardPage() {
               </Card>
             </Link>
           ) : (
-            <ResumeUploadDialog
-              open={isUploadDialogOpen}
-              onOpenChange={setIsUploadDialogOpen}
-              onUploadComplete={handleUploadComplete}
-              trigger={
-                <Card
-                  variant="interactive"
-                  className="aspect-square h-full hover:bg-primary hover:text-canvas"
-                >
-                  <div className="flex-1 flex flex-col justify-between pointer-events-none">
-                    <div className="w-14 h-14 border-2 border-current flex items-center justify-center mb-4">
-                      <span className="text-2xl leading-none relative top-[-2px]">+</span>
-                    </div>
-                    <div>
-                      <CardTitle className="text-xl uppercase">
-                        {t('dashboard.initializeMasterResume')}
-                      </CardTitle>
-                      <CardDescription className="mt-2 opacity-60 group-hover:opacity-100 text-current">
-                        {'// '}
-                        {t('dashboard.initializeSequence')}
-                      </CardDescription>
-                    </div>
+            <>
+              <Card
+                variant="interactive"
+                className="aspect-square h-full hover:bg-primary hover:text-canvas"
+                role="button"
+                tabIndex={0}
+                aria-label={t('dashboard.initializeMasterResume')}
+                onClick={() => setIsMasterChoiceDialogOpen(true)}
+                onKeyDown={handleInitializeMasterKeyDown}
+              >
+                <div className="flex-1 flex flex-col justify-between pointer-events-none">
+                  <div className="w-14 h-14 border-2 border-current flex items-center justify-center mb-4">
+                    <span className="text-2xl leading-none relative top-[-2px]">+</span>
                   </div>
-                </Card>
-              }
-            />
+                  <div>
+                    <CardTitle className="text-xl uppercase">
+                      {t('dashboard.initializeMasterResume')}
+                    </CardTitle>
+                    <CardDescription className="mt-2 opacity-60 group-hover:opacity-100 text-current">
+                      {'// '}
+                      {t('dashboard.initializeSequence')}
+                    </CardDescription>
+                  </div>
+                </div>
+              </Card>
+              <MasterResumeChoiceDialog
+                open={isMasterChoiceDialogOpen}
+                onOpenChange={setIsMasterChoiceDialogOpen}
+                onChooseUpload={handleChooseUpload}
+                onChooseWizard={handleChooseWizard}
+              />
+              <ResumeUploadDialog
+                open={isUploadDialogOpen}
+                onOpenChange={setIsUploadDialogOpen}
+                onUploadComplete={handleUploadComplete}
+                trigger={
+                  <button type="button" className="hidden" tabIndex={-1} aria-hidden="true" />
+                }
+              />
+            </>
           )
         ) : (
           // Master Resume Exists
@@ -390,7 +550,7 @@ export default function DashboardPage() {
                   <span className="font-mono font-bold text-lg">M</span>
                 </div>
                 <div className="flex gap-1">
-                  {processingStatus === 'failed' && (
+                  {(processingStatus === 'failed' || processingStatus === 'processing') && (
                     <>
                       <Button
                         variant="ghost"
@@ -398,6 +558,7 @@ export default function DashboardPage() {
                         className="h-8 w-8 hover:bg-blue-100 hover:text-blue-700 z-10 rounded-none relative"
                         onClick={handleRetryProcessing}
                         disabled={isRetrying}
+                        aria-label={t('dashboard.retryProcessing')}
                         title={t('dashboard.retryProcessing')}
                       >
                         {isRetrying ? (
@@ -422,7 +583,7 @@ export default function DashboardPage() {
                   {getStatusDisplay().icon}
                   {t('dashboard.statusLine', { status: getStatusDisplay().text })}
                 </div>
-                {processingStatus === 'failed' && (
+                {(processingStatus === 'failed' || processingStatus === 'processing') && (
                   <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
                     <Button
                       variant="outline"
@@ -470,7 +631,7 @@ export default function DashboardPage() {
                   >
                     <span className="font-mono font-bold">{getMonogram(title)}</span>
                   </div>
-                  <span className="font-mono text-xs text-gray-500 uppercase">
+                  <span className="font-mono text-xs text-steel-grey uppercase">
                     {resume.processing_status}
                   </span>
                 </div>
@@ -532,6 +693,18 @@ export default function DashboardPage() {
           confirmLabel={t('dashboard.deleteAndReupload')}
           cancelLabel={t('confirmations.keepResumeCancelLabel')}
           onConfirm={confirmDeleteAndReupload}
+          variant="danger"
+        />
+
+        <ConfirmDialog
+          open={deleteError}
+          onOpenChange={setDeleteError}
+          title={t('common.error')}
+          description={t('dashboard.errors.deleteFailed')}
+          confirmLabel={t('common.retry')}
+          cancelLabel={t('common.cancel')}
+          onConfirm={confirmDeleteAndReupload}
+          onCancel={() => setDeleteError(false)}
           variant="danger"
         />
       </SwissGrid>

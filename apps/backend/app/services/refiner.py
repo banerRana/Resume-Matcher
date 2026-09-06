@@ -14,6 +14,8 @@ import re
 from functools import lru_cache
 from typing import Any
 
+from app.ai_budget import AIOperationDeadlineExceeded
+from app.ai_limits import PromptSizeError
 from app.llm import complete_json
 from app.prompts.refinement import (
     AI_PHRASE_BLACKLIST,
@@ -27,25 +29,74 @@ from app.schemas.refinement import (
     RefinementConfig,
     RefinementResult,
 )
+from app.services.resume_preservation import finalize_ai_resume
 
 logger = logging.getLogger(__name__)
 
 # LLM-012: Job description truncation limits
 MAX_JD_LENGTH = 2000
 MIN_TRUNCATION_WARNING_LENGTH = 1500
+# Han (including supplementary planes), Kana, and Hangul syllables/Jamo.
+_CJK_CHAR_CLASS = (
+    r"[\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u31f0-\u31ff"
+    r"\u3400-\u9fff\ua960-\ua97f\uac00-\ud7ff\uf900-\ufaff"
+    r"\uff66-\uffdc\U0001b000-\U0001b16f\U00020000-\U0003ffff]"
+)
+_CJK_RE = re.compile(_CJK_CHAR_CLASS)
 
 
 def _keyword_in_text(keyword: str, text: str) -> bool:
-    """Check if keyword exists as a whole word in text.
+    """Check for a CJK substring or a bounded non-CJK term in text.
 
-    SVC-010: Uses word boundaries instead of substring matching to avoid
-    false positives like 'python' matching 'pythonic' or 'go' matching 'going'.
+    Han, Kana, and Hangul characters may adjoin Latin skills without whitespace,
+    so they also form boundaries for adjacent Latin terms. Other word characters
+    retain boundaries so 'python' does not match 'pythonic' and 'java' does not
+    match 'javascript'.
     """
-    # Escape special regex characters in keyword
-    escaped = re.escape(keyword.lower())
-    # Use word boundaries
-    pattern = rf"\b{escaped}\b"
-    return bool(re.search(pattern, text.lower()))
+    normalized_keyword = keyword.strip().lower()
+    if not normalized_keyword:
+        return False
+    normalized_text = text.lower()
+    if _CJK_RE.search(normalized_keyword):
+        return normalized_keyword in normalized_text
+    escaped = re.escape(normalized_keyword)
+    pattern = (
+        rf"(?:(?<!\w)|(?<={_CJK_CHAR_CLASS}))"
+        rf"{escaped}"
+        rf"(?:(?!\w)|(?={_CJK_CHAR_CLASS}))"
+    )
+    return bool(re.search(pattern, normalized_text))
+
+
+def count_retained_keywords(keywords: list[str], resume: dict[str, Any]) -> int:
+    """Count refinement keywords still present in the finalized resume."""
+    text = _extract_all_text(resume)
+    return sum(_keyword_in_text(keyword, text) for keyword in keywords)
+
+
+def _normalize_skill_key(skill: str) -> str:
+    """Normalize a skill for case-insensitive comparisons."""
+    return re.sub(r"\s+", " ", skill.strip()).casefold()
+
+
+def _extract_jd_skill_keys(
+    job_keywords: dict[str, Any],
+    job_description: str,
+) -> set[str]:
+    """Extract normalized required/preferred skills present in the raw JD."""
+    keys: set[str] = set()
+    for field in ("required_skills", "preferred_skills"):
+        values = job_keywords.get(field, [])
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if (
+                isinstance(value, str)
+                and value.strip()
+                and _keyword_in_text(value, job_description)
+            ):
+                keys.add(_normalize_skill_key(value))
+    return keys
 
 
 async def refine_resume(
@@ -72,6 +123,8 @@ async def refine_resume(
 
     current = _deep_copy(initial_tailored)
     passes = 0
+    attempts = 0
+    alignment_fixed = 0
     ai_phrases_found: list[str] = []
     keyword_analysis: KeywordGapAnalysis | None = None
     alignment: AlignmentReport | None = None
@@ -85,29 +138,51 @@ async def refine_resume(
                 len(keyword_analysis.injectable_keywords),
                 keyword_analysis.injectable_keywords,
             )
+            attempts += 1
+            before = _deep_copy(current)
             try:
-                current = await inject_keywords(
+                candidate = await inject_keywords(
                     current,
                     keyword_analysis.injectable_keywords,
                     master_resume,
                     job_description,
                 )
-                passes += 1
+                current = finalize_ai_resume(initial_tailored, candidate)
+                if current != before:
+                    passes += 1
+            except (AIOperationDeadlineExceeded, PromptSizeError):
+                raise
             except Exception as e:
                 logger.warning("Keyword injection failed: %s", e)
+                current = before
+
+    # The keyword writer is the last whole-resume author. Re-apply the source
+    # contract immediately after it so later deterministic cleanup and
+    # alignment can still remove disallowed content.
+    current = finalize_ai_resume(initial_tailored, current)
 
     # Pass 2: AI phrase removal and polish (local, no LLM call)
     if config.enable_ai_phrase_removal:
-        current, removed = remove_ai_phrases(current)
+        attempts += 1
+        before = _deep_copy(current)
+        current, removed = remove_ai_phrases(current, job_description)
         ai_phrases_found.extend(removed)
-        if removed:
+        if current != before:
             logger.info("Removed %d AI phrases: %s", len(removed), removed)
             passes += 1
 
     # Pass 3: Master alignment validation
     # LLM-008: Alignment validation is MANDATORY - not optional fallback
     if config.enable_master_alignment_check:
-        alignment = validate_master_alignment(current, master_resume)
+        attempts += 1
+        alignment = validate_master_alignment(
+            current,
+            master_resume,
+            allowed_new_skills=_extract_jd_skill_keys(
+                job_keywords,
+                job_description,
+            ),
+        )
         if not alignment.is_aligned:
             # Count critical violations
             critical_violations = [
@@ -119,19 +194,26 @@ async def refine_resume(
                 len(critical_violations),
             )
 
-            if critical_violations:
-                # LLM-008: Block resume with fabricated content
-                logger.error(
-                    "Critical alignment violations detected - blocking resume: %s",
-                    [v.value for v in critical_violations],
-                )
-                # Fix violations before returning
-                current = fix_alignment_violations(current, alignment.violations)
+            before = _deep_copy(current)
+            current = fix_alignment_violations(current, alignment.violations)
+            if current != before:
                 passes += 1
-            else:
-                # Non-critical violations - fix and continue
-                current = fix_alignment_violations(current, alignment.violations)
-                passes += 1
+            after = validate_master_alignment(
+                current,
+                master_resume,
+                allowed_new_skills=_extract_jd_skill_keys(
+                    job_keywords, job_description
+                ),
+            )
+            remaining = {
+                (v.field_path, v.violation_type, v.value)
+                for v in after.violations
+                if v.severity == "critical"
+            }
+            alignment_fixed = sum(
+                (v.field_path, v.violation_type, v.value) not in remaining
+                for v in critical_violations
+            )
 
     # Calculate final match percentage
     final_match = calculate_keyword_match(current, job_keywords)
@@ -139,6 +221,15 @@ async def refine_resume(
     return RefinementResult(
         refined_data=current,
         passes_completed=passes,
+        passes_attempted=attempts,
+        keywords_applied=[
+            keyword
+            for keyword in (
+                keyword_analysis.injectable_keywords if keyword_analysis else []
+            )
+            if _keyword_in_text(keyword, _extract_all_text(current))
+        ],
+        alignment_violations_fixed=alignment_fixed,
         keyword_analysis=keyword_analysis,
         alignment_report=alignment,
         ai_phrases_removed=ai_phrases_found,
@@ -198,24 +289,42 @@ def analyze_keyword_gaps(
     )
 
 
-def remove_ai_phrases(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+def remove_ai_phrases(
+    data: dict[str, Any],
+    job_description: str = "",
+) -> tuple[dict[str, Any], list[str]]:
     """Remove AI-generated phrases from resume content.
 
     This is a local operation that doesn't require an LLM call.
     It performs case-insensitive replacement of blacklisted phrases.
+    Phrases that appear in the job description are protected from removal.
 
     Args:
         data: Resume data dictionary
+        job_description: Job description text; phrases found here are skipped
 
     Returns:
         Tuple of (cleaned data, list of removed phrases)
     """
+    # Build set of JD-protected phrases
+    jd_lower = job_description.lower()
+    jd_protected: set[str] = set()
+    for phrase in AI_PHRASE_BLACKLIST:
+        if phrase.lower() in jd_lower:
+            jd_protected.add(phrase.lower())
+
+    if jd_protected:
+        logger.info("JD-protected phrases (skipping removal): %s", jd_protected)
+
     # Use a set to avoid duplicate tracking
     removed: set[str] = set()
 
     def clean_text(text: str) -> str:
         cleaned = text
         for phrase in AI_PHRASE_BLACKLIST:
+            # Skip phrases that appear in the job description
+            if phrase.lower() in jd_protected:
+                continue
             if phrase.lower() in cleaned.lower():
                 removed.add(phrase)
                 replacement = AI_PHRASE_REPLACEMENTS.get(phrase.lower(), "")
@@ -240,6 +349,7 @@ def remove_ai_phrases(data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
 def validate_master_alignment(
     tailored: dict[str, Any],
     master: dict[str, Any],
+    allowed_new_skills: set[str] | None = None,
 ) -> AlignmentReport:
     """Verify tailored resume doesn't contain fabricated content.
 
@@ -255,7 +365,7 @@ def validate_master_alignment(
     """
     violations: list[AlignmentViolation] = []
 
-    # Check skills
+    # Check skills - use full resume text for broader matching
     tailored_skills = set(
         s.lower()
         for s in tailored.get("additional", {}).get("technicalSkills", [])
@@ -266,16 +376,41 @@ def validate_master_alignment(
         for s in master.get("additional", {}).get("technicalSkills", [])
         if isinstance(s, str)
     )
+    allowed_skills = {
+        _normalize_skill_key(skill)
+        for skill in (allowed_new_skills or set())
+        if isinstance(skill, str) and skill.strip()
+    }
+    master_full_text = _extract_all_text(master).lower()
 
     for skill in tailored_skills - master_skills:
-        violations.append(
-            AlignmentViolation(
-                field_path="additional.technicalSkills",
-                violation_type="fabricated_skill",
-                value=skill,
-                severity="critical",
-            )
+        if _normalize_skill_key(skill) in allowed_skills:
+            continue
+        # Check substring/containment: e.g. "Python" in "Python 3.x"
+        has_substring_match = any(
+            skill in ms or ms in skill for ms in master_skills if ms
         )
+        # Check if skill appears anywhere in master resume text
+        found_in_text = _keyword_in_text(skill, master_full_text)
+
+        if has_substring_match or found_in_text:
+            violations.append(
+                AlignmentViolation(
+                    field_path="additional.technicalSkills",
+                    violation_type="skill_variant",
+                    value=skill,
+                    severity="info",
+                )
+            )
+        else:
+            violations.append(
+                AlignmentViolation(
+                    field_path="additional.technicalSkills",
+                    violation_type="fabricated_skill",
+                    value=skill,
+                    severity="critical",
+                )
+            )
 
     # Check certifications
     tailored_certs = set(
@@ -373,6 +508,78 @@ def _validate_resume_structure(data: dict[str, Any]) -> bool:
     return True
 
 
+def _preserve_description_styles(
+    original: dict[str, Any], improved: dict[str, Any]
+) -> dict[str, Any]:
+    """Restore descriptionStyles the LLM dropped or truncated (H-04).
+
+    ``descriptionStyles`` is positional metadata parallel to ``description``.
+    An LLM cannot be relied on to carry it through a rewrite, and when it is
+    absent ``ResumeData`` silently backfills every row to ``"bullet"`` — so a
+    user's "plain" rows are erased with no warning and no log.
+
+    Rows are matched by index, which is the same contract the frontend and the
+    Pydantic validators use. Where the improved list is longer than the
+    original, the extra rows keep whatever the model returned (defaulting to
+    bullet downstream).
+
+    Args:
+        original: The resume before refinement.
+        improved: The resume returned by the LLM.
+
+    Returns:
+        ``improved``, mutated in place, with descriptionStyles restored.
+    """
+    item_fields = ("workExperience", "personalProjects")
+
+    def _restore(orig_items: Any, new_items: Any) -> None:
+        if not isinstance(orig_items, list) or not isinstance(new_items, list):
+            return
+        for index, new_item in enumerate(new_items):
+            if index >= len(orig_items):
+                continue
+            orig_item = orig_items[index]
+            if not isinstance(orig_item, dict) or not isinstance(new_item, dict):
+                continue
+            orig_styles = orig_item.get("descriptionStyles")
+            if not isinstance(orig_styles, list) or not orig_styles:
+                continue
+            new_styles = new_item.get("descriptionStyles")
+            if isinstance(new_styles, list) and len(new_styles) == len(
+                new_item.get("description") or []
+            ):
+                # The model returned a correctly-aligned list; trust it.
+                continue
+            description = new_item.get("description")
+            if not isinstance(description, list):
+                continue
+            new_item["descriptionStyles"] = [
+                orig_styles[i] if i < len(orig_styles) else "bullet"
+                for i in range(len(description))
+            ]
+            logger.debug(
+                "Restored descriptionStyles dropped by the LLM (index %d)", index
+            )
+
+    for field in item_fields:
+        _restore(original.get(field), improved.get(field))
+
+    # customSections is `dict[str, CustomSection]` keyed by section id (see
+    # ResumeData in app/schemas/models.py) -- NOT a list. Matching by position
+    # would be wrong even if the shape allowed it, since dict ordering is not
+    # part of the contract; match by key.
+    orig_sections = original.get("customSections")
+    new_sections = improved.get("customSections")
+    if isinstance(orig_sections, dict) and isinstance(new_sections, dict):
+        for key, new_section in new_sections.items():
+            orig_section = orig_sections.get(key)
+            if not isinstance(orig_section, dict) or not isinstance(new_section, dict):
+                continue
+            _restore(orig_section.get("items"), new_section.get("items"))
+
+    return improved
+
+
 async def inject_keywords(
     tailored: dict[str, Any],
     keywords_to_inject: list[str],
@@ -403,10 +610,18 @@ async def inject_keywords(
 
     prompt = KEYWORD_INJECTION_PROMPT.format(
         keywords_to_inject=json.dumps(keywords_to_inject),
-        current_resume=json.dumps(tailored, indent=2),
-        master_resume=json.dumps(master, indent=2),
+        current_resume=json.dumps(tailored),
+        master_resume=json.dumps(master),
         job_description=truncated_jd,
     )
+
+    def validate_writer_result(result: dict[str, Any]) -> dict[str, Any]:
+        if not _validate_resume_structure(result):
+            raise ValueError("Keyword injection corrupted resume structure")
+        for field in ("workExperience", "education", "personalProjects"):
+            if tailored.get(field) and not result.get(field):
+                raise ValueError(f"Keyword injection omitted populated {field}")
+        return result
 
     try:
         result = await complete_json(
@@ -416,6 +631,7 @@ async def inject_keywords(
                 "fabricated content. Return only valid JSON matching the input schema."
             ),
             max_tokens=8192,
+            response_validator=validate_writer_result,
         )
 
         # LLM-014: Validate the result maintains required structure
@@ -429,8 +645,14 @@ async def inject_keywords(
             )
             return tailored
 
-        return result
+        # H-04: the prompt asks the model to preserve descriptionStyles, but a
+        # prompt is not a guarantee for positional metadata. Restore it locally,
+        # matching the defence-in-depth pattern the improve pipeline already
+        # uses for dates, skills, personalInfo and custom sections.
+        return _preserve_description_styles(tailored, result)
 
+    except (AIOperationDeadlineExceeded, PromptSizeError):
+        raise
     except Exception as e:
         logger.warning("Keyword injection failed: %s", e)
         return tailored
@@ -581,6 +803,38 @@ def _extract_all_text_cached(data_json: str) -> str:
         certs = additional.get("certificationsTraining", [])
         if isinstance(certs, list):
             parts.extend(str(c) for c in certs)
+        languages = additional.get("languages", [])
+        if isinstance(languages, list):
+            parts.extend(str(lang) for lang in languages)
+        awards = additional.get("awards", [])
+        if isinstance(awards, list):
+            parts.extend(str(a) for a in awards)
+
+    # Custom sections
+    custom_sections = data.get("customSections", {})
+    if isinstance(custom_sections, dict):
+        for section in custom_sections.values():
+            if not isinstance(section, dict):
+                continue
+            section_type = section.get("sectionType", "")
+            if section_type == "itemList":
+                for item in section.get("items", []):
+                    if isinstance(item, dict):
+                        parts.append(str(item.get("title", "")))
+                        parts.append(str(item.get("subtitle", "")))
+                        desc = item.get("description", [])
+                        if isinstance(desc, list):
+                            parts.extend(str(d) for d in desc)
+                        elif isinstance(desc, str):
+                            parts.append(desc)
+            elif section_type == "text":
+                text = section.get("text", "")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif section_type == "stringList":
+                items = section.get("strings", [])
+                if isinstance(items, list):
+                    parts.extend(str(i) for i in items)
 
     return " ".join(p for p in parts if p)
 

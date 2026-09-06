@@ -68,7 +68,7 @@ cd Resume-Matcher
 cd apps/backend
 cp .env.example .env        # Create config from template
 uv sync                      # Install Python dependencies
-uv run uvicorn app.main:app --reload --port 8000
+uv run app
 
 # 3. Start the frontend (Terminal 2)
 cd apps/frontend
@@ -144,7 +144,7 @@ This creates a virtual environment and installs all required packages.
 #### Start the backend server
 
 ```bash
-uv run uvicorn app.main:app --reload --port 8000
+RELOAD=true uv run app
 ```
 
 You should see output like:
@@ -206,10 +206,14 @@ Resume Matcher supports multiple AI providers. You can configure your provider t
 | Provider | Configuration | Get API Key |
 |----------|--------------|-------------|
 | **OpenAI** | `LLM_PROVIDER=openai`<br>`LLM_MODEL=gpt-5-nano-2025-08-07` | [platform.openai.com](https://platform.openai.com/api-keys) |
+| **Azure AI Foundry** | `LLM_PROVIDER=azure_foundry`<br>`LLM_MODEL=mistral-large-latest`<br>`LLM_API_BASE=https://<resource>.services.ai.azure.com/models`<br>For Foundry-hosted Azure OpenAI GPT deployments, use the service root or the full `/openai/v1/responses` endpoint from Foundry. | Azure AI Foundry endpoint/key |
 | **Anthropic** | `LLM_PROVIDER=anthropic`<br>`LLM_MODEL=claude-haiku-4-5-20251001` | [console.anthropic.com](https://console.anthropic.com/) |
-| **Google Gemini** | `LLM_PROVIDER=gemini`<br>`LLM_MODEL=gemini-3-flash-preview` | [aistudio.google.com](https://aistudio.google.com/app/apikey) |
+| **Google Gemini** | `LLM_PROVIDER=gemini`<br>`LLM_MODEL=gemini/gemini-3-flash-preview` | [aistudio.google.com](https://aistudio.google.com/app/apikey) |
 | **OpenRouter** | `LLM_PROVIDER=openrouter`<br>`LLM_MODEL=deepseek/deepseek-chat` | [openrouter.ai](https://openrouter.ai/keys) |
 | **DeepSeek** | `LLM_PROVIDER=deepseek`<br>`LLM_MODEL=deepseek-chat` | [platform.deepseek.com](https://platform.deepseek.com/) |
+| **OpenAI-Compatible** | `LLM_PROVIDER=openai_compatible`<br>`LLM_MODEL=llama-3.1-8b`<br>`LLM_API_BASE=http://localhost:8080/v1` | — (local) |
+
+**OpenAI-Compatible** targets any local server that exposes the OpenAI Chat Completions API — llama.cpp, vLLM, LM Studio, etc. API key is optional.
 
 Example `.env` for Anthropic:
 
@@ -261,95 +265,109 @@ Prefer containerized deployment? Resume Matcher includes Docker support.
 ### Quick Start with Docker Compose
 
 ```bash
-# Build and start the containers
-docker-compose up -d
+# Start the container from a published image
+docker compose up -d
 
 # View logs
-docker-compose logs -f
+docker compose logs -f
 
-# Stop the containers
-docker-compose down
+# Stop the container
+docker compose down
 ```
 
 ### Customizing Ports
 
-By default, Resume Matcher runs on ports 3000 (frontend) and 8000 (backend). To use different ports:
-
-**Option 1: Environment Variables (Frontend port only)**
-
 ```bash
-# Change frontend port only (no rebuild needed)
-FRONTEND_PORT=4000 docker-compose up -d
-```
-
-**Option 2: Changing the Backend Port (requires rebuild)**
-
-The frontend's API URL is baked into the JavaScript bundle at build time. If you change `BACKEND_PORT`, you must rebuild the image:
-
-```bash
-# Build with custom backend port
-BACKEND_PORT=9000 docker-compose build
-
-# Then run with the same port
-BACKEND_PORT=9000 docker-compose up -d
-```
-
-Or create a `.env` file and rebuild:
-
-```bash
-# Create .env file
-cat > .env << EOF
-FRONTEND_PORT=4000
-BACKEND_PORT=9000
-LLM_PROVIDER=openai
-LLM_API_KEY=sk-your-key-here
-EOF
-
-# Rebuild and run
-docker-compose build && docker-compose up -d
+# Change host port only (container stays on 3000)
+PORT=4000 docker compose up -d
 ```
 
 ### Configuration Options
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FRONTEND_PORT` | `3000` | Host port for the web interface |
-| `BACKEND_PORT` | `8000` | Host port for the API |
+| `PORT` | `3000` | Host port mapped to container port `3000` |
+| `LOG_LEVEL` | `INFO` | Application-wide Python/Uvicorn log level (`ERROR`, `WARNING`, `INFO`, `DEBUG`) |
+| `LOG_LLM` | `WARNING` | LiteLLM log level (`ERROR`, `WARNING`, `INFO`, `DEBUG`) |
 | `LLM_PROVIDER` | `openai` | AI provider (openai, anthropic, gemini, etc.) |
 | `LLM_MODEL` | — | Model to use (configured via Settings UI) |
 | `LLM_API_KEY` | — | API key (recommended: configure via Settings UI) |
 | `LLM_API_BASE` | — | Custom API endpoint (for Ollama or proxies) |
+
+> **Note:** Changes to `LOG_LEVEL` and `LOG_LLM` require a container restart to take effect.
 
 ### Using Ollama with Docker
 
 To use Ollama running on your host machine:
 
 ```bash
-LLM_API_BASE=http://host.docker.internal:11434 docker-compose up -d
+LLM_API_BASE=http://host.docker.internal:11434 docker compose up -d
 ```
 
 Then configure Ollama as your provider in the Settings UI.
+
+### Using Docker Secrets
+
+The container supports `*_FILE` from
+[docker secrets](https://docs.docker.com/compose/how-tos/use-secrets/#use-secrets).
+For sensitive values, you can mount a secret file and point to it:
+
+```bash
+LLM_API_KEY_FILE=/run/secrets/llm_api_key docker compose up -d
+```
+
+Supported `*_FILE` variables:
+
+| Variable | `*_FILE` variant |
+|----------|-----------------|
+| `LOG_LEVEL` | `LOG_LEVEL_FILE` |
+| `LOG_LLM` | `LOG_LLM_FILE` |
+| `LLM_PROVIDER` | `LLM_PROVIDER_FILE` |
+| `LLM_MODEL` | `LLM_MODEL_FILE` |
+| `LLM_API_KEY` | `LLM_API_KEY_FILE` |
+| `LLM_API_BASE` | `LLM_API_BASE_FILE` |
+
+Rules:
+
+- Use either the variable or its `*_FILE` variant, not both.
+- If both are set, the container exits with an explicit error.
+
+### Logging Level Configuration
+
+You can tune logs globally and for LiteLLM separately:
+
+```bash
+LOG_LEVEL=INFO LOG_LLM=DEBUG docker compose up -d
+```
+
+> **Security warning:** `LOG_LLM=DEBUG` causes LiteLLM to log API keys in
+> plaintext. Do not use `DEBUG` level in production or shared environments.
+> The default `WARNING` is safe.
+
+> **Note:** LiteLLM also reads the `LITELLM_LOG` environment variable internally
+> to control handler-level filtering. `LOG_LLM` sets the *logger* level. Both must
+> allow a message for it to appear. If you set `LITELLM_LOG` from LiteLLM docs,
+> make sure `LOG_LLM` is set to an equal or lower level.
 
 ### Important Notes
 
 - **API keys are best configured through the UI** at `http://localhost:3000/settings`
 - Data is persisted in a Docker volume (`resume-data`)
 - The Settings UI configuration is stored in the volume and persists across restarts
-- **Backend port changes require a rebuild** - the frontend API URL is baked into the JS bundle at build time
+- App and API share the same origin: frontend on `/`, API on `/api`
 
 
 
 ## Accessing the Application
 
-Once both servers are running, open your browser:
+Once the container is running, open your browser:
 
 | URL | Description |
 |-----|-------------|
 | **<http://localhost:3000>** | Main application (Dashboard) |
 | **<http://localhost:3000/settings>** | Configure AI provider |
-| **<http://localhost:8000>** | Backend API root |
-| **<http://localhost:8000/docs>** | Interactive API documentation |
-| **<http://localhost:8000/health>** | Backend health check |
+| **<http://localhost:3000/api/v1/health>** | Backend health check |
+| **<http://localhost:3000/docs>** | Interactive API documentation |
 
 ### First-Time Setup Checklist
 
@@ -370,7 +388,7 @@ Once both servers are running, open your browser:
 cd apps/backend
 
 # Start development server (with auto-reload)
-uv run uvicorn app.main:app --reload --port 8000
+RELOAD=true uv run app
 
 # Start production server
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -481,6 +499,32 @@ FRONTEND_BASE_URL=http://localhost:3001
 CORS_ORIGINS=["http://localhost:3001", "http://127.0.0.1:3001"]
 ```
 
+### Chinese / Japanese / Korean text renders as boxes (□□□) in the PDF
+
+The PDF is rendered by headless Chromium, which falls back to **system** fonts
+for any glyph the bundled webfonts don't cover. A headless Linux host usually
+ships none for CJK, so the text becomes tofu boxes.
+
+**Docker users:** nothing to do — the image installs `fonts-noto-cjk`.
+
+**Running without Docker:** install system CJK fonts on the machine running the
+backend.
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y fonts-noto-cjk
+
+# Fedora / RHEL
+sudo dnf install -y google-noto-sans-cjk-fonts
+
+# Arch
+sudo pacman -S noto-fonts-cjk
+
+# macOS — CJK fonts ship with the OS, no action needed
+```
+
+Restart the backend afterwards so Chromium picks up the new font cache.
+
 ### Ollama connection fails
 
 **Error:** `Connection refused to localhost:11434`
@@ -539,7 +583,7 @@ Stuck? Here are your options:
 |----------|-------------|
 | [backend-guide.md](docs/agent/architecture/backend-guide.md) | Backend architecture and API details |
 | [frontend-workflow.md](docs/agent/architecture/frontend-workflow.md) | User flow and component architecture |
-| [style-guide.md](docs/agent/design/style-guide.md) | UI design system (Swiss International Style) |
+| [swiss-design-system/](docs/portable/swiss-design-system/README.md) | UI design system (Swiss International Style) — portable pack |
 
 ---
 

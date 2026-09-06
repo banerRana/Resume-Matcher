@@ -1,8 +1,12 @@
-import { ImprovedResult } from '@/components/common/resume_previewer_context';
+import type {
+  ImprovedResult,
+  InterviewPrepData,
+} from '@/components/common/resume_previewer_context';
 import type { ResumeData } from '@/components/dashboard/resume-component';
 import { type TemplateSettings } from '@/lib/types/template-settings';
 import { type Locale } from '@/i18n/config';
-import { API_BASE, apiPost, apiPatch, apiDelete, apiFetch } from './client';
+import { clearResumeWizardCompletion } from '@/lib/utils/resume-wizard-storage';
+import { API_BASE, DEFAULT_TIMEOUT_MS, apiPost, apiPatch, apiDelete, apiFetch } from './client';
 
 // Matches backend schemas/models.py ResumeData
 interface ProcessedResume {
@@ -24,6 +28,7 @@ interface ProcessedResume {
     location?: string | null;
     years?: string;
     description?: string[];
+    descriptionStyles?: ('bullet' | 'plain')[];
   }>;
   education?: Array<{
     id: number;
@@ -40,6 +45,7 @@ interface ProcessedResume {
     github?: string | null;
     website?: string | null;
     description?: string[];
+    descriptionStyles?: ('bullet' | 'plain')[];
   }>;
   additional?: {
     technicalSkills?: string[];
@@ -63,6 +69,7 @@ interface ResumeResponse {
     processed_resume: ProcessedResume | null;
     cover_letter?: string | null;
     outreach_message?: string | null;
+    interview_prep?: InterviewPrepData | null;
     parent_id?: string | null; // For determining if resume is tailored
     title?: string | null;
   };
@@ -80,6 +87,7 @@ export interface ResumeUploadResponse {
 interface ImproveResumeConfirmRequest {
   resume_id: string;
   job_id: string;
+  preview_id?: string | null;
   improved_data: ResumeData;
   improvements: Array<{
     suggestion: string;
@@ -114,7 +122,9 @@ async function postImprove(
 ): Promise<ImprovedResult> {
   let response: Response;
   try {
-    response = await apiPost(endpoint, payload);
+    // Use the configurable request timeout so NEXT_PUBLIC_REQUEST_TIMEOUT_MS
+    // actually applies to the long-running improve/preview/confirm calls (#776).
+    response = await apiPost(endpoint, payload, DEFAULT_TIMEOUT_MS);
   } catch (networkError) {
     console.error(`Network error during ${endpoint}:`, networkError);
     throw networkError;
@@ -272,6 +282,7 @@ export async function deleteResume(resumeId: string): Promise<void> {
     const text = await res.text().catch(() => '');
     throw new Error(`Failed to delete resume (status ${res.status}): ${text}`);
   }
+  clearResumeWizardCompletion(resumeId);
 }
 
 /** Updates the cover letter for a resume */
@@ -353,9 +364,27 @@ export async function generateOutreachMessage(resumeId: string): Promise<string>
   return data.content;
 }
 
+/** Generates interview preparation on-demand for a tailored resume */
+export async function generateInterviewPrep(resumeId: string): Promise<InterviewPrepData> {
+  const res = await apiPost(`/resumes/${encodeURIComponent(resumeId)}/generate-interview-prep`, {});
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Failed to generate interview preparation (status ${res.status}): ${text}`);
+  }
+  const data = (await res.json()) as { interview_prep: InterviewPrepData };
+  return data.interview_prep;
+}
+
 /** Retries AI processing for a failed resume */
-export async function retryProcessing(resumeId: string): Promise<ResumeUploadResponse> {
+export async function retryProcessing(
+  resumeId: string
+): Promise<Pick<ResumeUploadResponse, 'resume_id' | 'processing_status'>> {
   const res = await apiPost(`/resumes/${encodeURIComponent(resumeId)}/retry-processing`, {});
+  if (res.status === 409) {
+    // Another attempt owns the row. Observe it instead of labeling it failed.
+    const current = await fetchResume(resumeId);
+    return { resume_id: resumeId, processing_status: current.raw_resume.processing_status };
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`Failed to retry processing (status ${res.status}): ${text}`);

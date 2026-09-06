@@ -1,13 +1,27 @@
 import { apiFetch } from './client';
 
 // Supported LLM providers
-export type LLMProvider = 'openai' | 'anthropic' | 'openrouter' | 'gemini' | 'deepseek' | 'ollama';
+export type LLMProvider =
+  | 'openai'
+  | 'openai_compatible'
+  | 'azure_foundry'
+  | 'anthropic'
+  | 'openrouter'
+  | 'gemini'
+  | 'deepseek'
+  | 'groq'
+  | 'ollama';
+
+// Reasoning-effort levels supported by LiteLLM. `null` (or absent) means
+// "do not send the parameter" — the default for max compatibility.
+export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high';
 
 export interface LLMConfig {
   provider: LLMProvider;
   model: string;
   api_key: string;
   api_base: string | null;
+  reasoning_effort: ReasoningEffort | null;
 }
 
 export interface LLMConfigUpdate {
@@ -15,6 +29,8 @@ export interface LLMConfigUpdate {
   model?: string;
   api_key?: string;
   api_base?: string | null;
+  // Pass '' (empty string) to clear; null is ignored by the server.
+  reasoning_effort?: ReasoningEffort | '' | null;
 }
 
 export interface DatabaseStats {
@@ -43,6 +59,7 @@ export interface LLMHealthCheck {
   warning_code?: string;
   test_prompt?: string;
   model_output?: string;
+  reasoning_content?: string | null;
   error_detail?: string;
 }
 
@@ -73,8 +90,20 @@ export async function updateLlmConfig(config: LLMConfigUpdate): Promise<LLMConfi
   });
 
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || `Failed to update LLM config (status ${res.status}).`);
+    const data = (await res.json().catch(() => ({}))) as { detail?: unknown };
+    // FastAPI returns `detail` as a string OR a structured object (this
+    // endpoint now emits {code, field, missing} for a missing Base URL).
+    // Passing an object straight to `new Error()` renders "[object Object]",
+    // so serialize explicitly — same treatment as updateFeaturePrompts.
+    let message: string;
+    if (typeof data.detail === 'string') {
+      message = data.detail;
+    } else if (data.detail) {
+      message = JSON.stringify(data.detail);
+    } else {
+      message = `Failed to update LLM config (status ${res.status}).`;
+    }
+    throw new Error(message);
   }
 
   return res.json();
@@ -122,9 +151,43 @@ export async function fetchSystemStatus(): Promise<SystemStatus> {
 // Provider display names and default models
 export const PROVIDER_INFO: Record<
   LLMProvider,
-  { name: string; defaultModel: string; requiresKey: boolean }
+  {
+    name: string;
+    defaultModel: string;
+    requiresKey: boolean;
+    requiresBaseUrl?: boolean;
+    /**
+     * Base URL this provider owns. Used both to seed the field on switch-in
+     * and to decide whether to clear it on switch-out, so a previous
+     * provider's endpoint can't be persisted against the next one.
+     */
+    defaultBaseUrl?: string;
+    /**
+     * i18n key suffix under `settings.llmConfiguration.` for provider-specific
+     * base-URL copy. The example URL stays a literal in baseUrlPlaceholder.
+     */
+    baseUrlI18nKey?: string;
+    baseUrlPlaceholder?: string;
+  }
 > = {
   openai: { name: 'OpenAI', defaultModel: 'gpt-5-nano-2025-08-07', requiresKey: true },
+  // OpenAI-compatible: llama.cpp, vLLM, LM Studio, and other servers that expose
+  // the OpenAI Chat Completions API. Key is optional (most local servers don't
+  // require auth); backend passes a sentinel when blank.
+  openai_compatible: {
+    name: 'OpenAI-Compatible (Local)',
+    defaultModel: 'custom-model',
+    requiresKey: false,
+    defaultBaseUrl: 'http://localhost:8080/v1',
+  },
+  azure_foundry: {
+    name: 'Azure AI Foundry',
+    defaultModel: 'mistral-large-latest',
+    requiresKey: true,
+    requiresBaseUrl: true,
+    baseUrlI18nKey: 'azure',
+    baseUrlPlaceholder: 'https://<resource>.services.ai.azure.com/openai/v1/responses',
+  },
   anthropic: { name: 'Anthropic', defaultModel: 'claude-haiku-4-5-20251001', requiresKey: true },
   openrouter: {
     name: 'OpenRouter',
@@ -133,18 +196,26 @@ export const PROVIDER_INFO: Record<
   },
   gemini: { name: 'Google Gemini', defaultModel: 'gemini-3-flash-preview', requiresKey: true },
   deepseek: { name: 'DeepSeek', defaultModel: 'deepseek-chat', requiresKey: true },
-  ollama: { name: 'Ollama (Local)', defaultModel: 'gemma3:4b', requiresKey: false },
+  groq: { name: 'Groq', defaultModel: 'llama-3.3-70b-versatile', requiresKey: true },
+  ollama: {
+    name: 'Ollama (Local)',
+    defaultModel: 'gemma3:4b',
+    requiresKey: false,
+    defaultBaseUrl: 'http://localhost:11434',
+  },
 };
 
 // Feature configuration types
 export interface FeatureConfig {
   enable_cover_letter: boolean;
   enable_outreach_message: boolean;
+  enable_interview_prep: boolean;
 }
 
 export interface FeatureConfigUpdate {
   enable_cover_letter?: boolean;
   enable_outreach_message?: boolean;
+  enable_interview_prep?: boolean;
 }
 
 // Fetch feature configuration
@@ -176,7 +247,7 @@ export async function updateFeatureConfig(config: FeatureConfigUpdate): Promise<
 }
 
 // Language configuration types
-export type SupportedLanguage = 'en' | 'es' | 'zh' | 'ja' | 'pt';
+export type SupportedLanguage = 'en' | 'es' | 'zh' | 'ja' | 'pt' | 'fr' | 'ko';
 
 export interface LanguageConfig {
   ui_language: SupportedLanguage;
@@ -260,8 +331,108 @@ export async function updatePromptConfig(update: PromptConfigUpdate): Promise<Pr
   return res.json();
 }
 
+// Custom feature prompts (cover letter, cold outreach)
+export interface FeaturePrompts {
+  cover_letter_prompt: string;
+  outreach_message_prompt: string;
+  cover_letter_default: string;
+  outreach_message_default: string;
+}
+
+export interface FeaturePromptsUpdate {
+  cover_letter_prompt?: string;
+  outreach_message_prompt?: string;
+}
+
+// 422 response shape when the user submits a prompt missing required
+// placeholders. The backend lists each missing token so the UI can point
+// users at exactly what's absent.
+export interface FeaturePromptsValidationError {
+  code: 'missing_placeholders';
+  field: 'cover_letter_prompt' | 'outreach_message_prompt';
+  missing: string[];
+}
+
+export class FeaturePromptsError extends Error {
+  detail: FeaturePromptsValidationError;
+
+  constructor(detail: FeaturePromptsValidationError) {
+    super(`Invalid ${detail.field}: missing ${detail.missing.join(', ')}`);
+    this.name = 'FeaturePromptsError';
+    this.detail = detail;
+  }
+}
+
+export async function fetchFeaturePrompts(): Promise<FeaturePrompts> {
+  const res = await apiFetch('/config/feature-prompts', { credentials: 'include' });
+  if (!res.ok) {
+    throw new Error(`Failed to load feature prompts (status ${res.status}).`);
+  }
+  return res.json();
+}
+
+export async function updateFeaturePrompts(update: FeaturePromptsUpdate): Promise<FeaturePrompts> {
+  const res = await apiFetch('/config/feature-prompts', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(update),
+  });
+
+  if (!res.ok) {
+    // Error path: body may be absent or malformed, so we tolerate parse
+    // failure. A fetch body is a one-shot stream — read it once and reuse
+    // for both the 422-special-case and the generic fallback.
+    const errBody = (await res.json().catch(() => ({}))) as {
+      detail?: FeaturePromptsValidationError | string;
+    };
+    if (
+      res.status === 422 &&
+      typeof errBody.detail === 'object' &&
+      errBody.detail?.code === 'missing_placeholders'
+    ) {
+      throw new FeaturePromptsError(errBody.detail);
+    }
+    // FastAPI can return ``detail`` as a string or a structured object.
+    // Stringifying an object via the ``||`` shortcut yields "[object Object]";
+    // serialize explicitly.
+    let message: string;
+    if (typeof errBody.detail === 'string') {
+      message = errBody.detail;
+    } else if (errBody.detail) {
+      message = JSON.stringify(errBody.detail);
+    } else {
+      message = `Failed to update feature prompts (status ${res.status}).`;
+    }
+    throw new Error(message);
+  }
+
+  // Success path: require a valid JSON body. Swallowing parse errors here
+  // would let an invalid success response be returned as FeaturePrompts
+  // with undefined fields — caller code would then read .cover_letter_prompt
+  // and get surprising behavior. Let the parse error propagate.
+  return (await res.json()) as FeaturePrompts;
+}
+
 // API Key Management types
-export type ApiKeyProvider = 'openai' | 'anthropic' | 'google' | 'openrouter' | 'deepseek';
+export type ApiKeyProvider =
+  | 'openai'
+  | 'azure_foundry'
+  | 'anthropic'
+  | 'google'
+  | 'openrouter'
+  | 'deepseek'
+  | 'groq'
+  | 'openai_compatible'
+  | 'ollama';
+
+// Map an LLM provider (the active-provider axis) to its key-store provider
+// name. Mirrors the backend `_PROVIDER_KEY_MAP` (gemini → google; the local
+// providers pass through). Keys are persisted under the key-store name.
+export function llmProviderToKeyProvider(provider: LLMProvider): ApiKeyProvider {
+  if (provider === 'gemini') return 'google';
+  return provider as ApiKeyProvider;
+}
 
 export interface ApiKeyProviderStatus {
   provider: ApiKeyProvider;
@@ -275,10 +446,14 @@ export interface ApiKeyStatusResponse {
 
 export interface ApiKeysUpdateRequest {
   openai?: string;
+  azure_foundry?: string;
   anthropic?: string;
   google?: string;
   openrouter?: string;
   deepseek?: string;
+  groq?: string;
+  openai_compatible?: string;
+  ollama?: string;
 }
 
 export interface ApiKeysUpdateResponse {
@@ -290,10 +465,14 @@ export interface ApiKeysUpdateResponse {
 export const API_KEY_PROVIDER_INFO: Record<ApiKeyProvider, { name: string; description: string }> =
   {
     openai: { name: 'OpenAI', description: 'GPT-4, GPT-4o, etc.' },
+    azure_foundry: { name: 'Azure AI Foundry', description: 'Azure AI Inference models' },
     anthropic: { name: 'Anthropic', description: 'Claude 3.5, Claude 4, etc.' },
     google: { name: 'Google', description: 'Gemini 1.5, Gemini 2, etc.' },
     openrouter: { name: 'OpenRouter', description: 'Access multiple providers' },
     deepseek: { name: 'DeepSeek', description: 'DeepSeek chat models' },
+    groq: { name: 'Groq', description: 'Llama, Mixtral, Gemma on Groq' },
+    openai_compatible: { name: 'OpenAI-Compatible', description: 'Self-hosted / proxy endpoints' },
+    ollama: { name: 'Ollama', description: 'Local Ollama server' },
   };
 
 // Fetch API key status for all providers

@@ -7,12 +7,14 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from app.config import settings
-from app.llm import check_llm_health, LLMConfig
+from app.llm import check_llm_health, LLMConfig, resolve_api_key
 from app.schemas import (
     LLMConfigRequest,
     LLMConfigResponse,
     FeatureConfigRequest,
     FeatureConfigResponse,
+    FeaturePromptsRequest,
+    FeaturePromptsResponse,
     LanguageConfigRequest,
     LanguageConfigResponse,
     PromptConfigRequest,
@@ -24,36 +26,59 @@ from app.schemas import (
     ApiKeysUpdateResponse,
     ResetDatabaseRequest,
 )
-from app.prompts import DEFAULT_IMPROVE_PROMPT_ID, IMPROVE_PROMPT_OPTIONS
+from app.prompts import (
+    DEFAULT_IMPROVE_PROMPT_ID,
+    IMPROVE_PROMPT_OPTIONS,
+    validate_prompt_placeholders,
+)
+from app.prompts.templates import COVER_LETTER_PROMPT, OUTREACH_MESSAGE_PROMPT
 from app.config import (
     get_api_keys_from_config,
+    get_config_path,
     save_api_keys_to_config,
     delete_api_key_from_config,
     clear_all_api_keys,
+    load_config_file,
+    save_config_file,
 )
+from app.config_cache import invalidate_config_cache
 from app.database import db
+
+# Providers that cannot function without an explicit endpoint. Mirrors
+# `requiresBaseUrl` in apps/frontend/lib/api/config.ts (M-05) — the UI guard
+# alone left the .env-driven setup path able to persist an unusable config.
+PROVIDERS_REQUIRING_BASE_URL: frozenset[str] = frozenset({"azure_foundry"})
+
+
+def _effective_api_base(stored: dict) -> str | None:
+    """Resolve the base URL the LLM layer will actually use.
+
+    ``stored.get("api_base", default)`` returns None when the key is PRESENT
+    with a null value — which is exactly what an explicit "clear the field"
+    writes. That made validation (which fell back to the env var) disagree with
+    config construction (which did not): saving with LLM_API_BASE set passed
+    the required-base-URL check and then handed api_base=None to LiteLLM.
+    Every site resolves through here so they cannot drift again.
+    """
+    return stored.get("api_base") or settings.llm_api_base or None
 
 router = APIRouter(prefix="/config", tags=["Configuration"])
 
 
 def _get_config_path() -> Path:
     """Get path to config storage file."""
-    return settings.config_path
+    return get_config_path()
 
 
 def _load_config() -> dict:
-    """Load config from file."""
-    path = _get_config_path()
-    if path.exists():
-        return json.loads(path.read_text())
-    return {}
+    """Load config with decrypted API keys injected (so resolve_api_key works)."""
+    return load_config_file()
 
 
 def _save_config(config: dict) -> None:
-    """Save config to file."""
-    path = _get_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config, indent=2))
+    """Save non-secret config (keys stripped) and invalidate the shared cache."""
+    save_config_file(config)
+    invalidate_config_cache()
 
 
 def _mask_api_key(key: str) -> str:
@@ -91,11 +116,14 @@ async def get_llm_config_endpoint() -> LLMConfigResponse:
     """Get current LLM configuration (API key masked)."""
     stored = _load_config()
 
+    provider = stored.get("provider", settings.llm_provider)
+    reasoning_effort = stored.get("reasoning_effort", settings.reasoning_effort)
     return LLMConfigResponse(
-        provider=stored.get("provider", settings.llm_provider),
+        provider=provider,
         model=stored.get("model", settings.llm_model),
-        api_key=_mask_api_key(stored.get("api_key", settings.llm_api_key)),
-        api_base=stored.get("api_base", settings.llm_api_base),
+        api_key=_mask_api_key(resolve_api_key(stored, provider)),
+        api_base=_effective_api_base(stored),
+        reasoning_effort=reasoning_effort or None,
     )
 
 
@@ -120,17 +148,53 @@ async def update_llm_config(
         stored["provider"] = request.provider
     if request.model is not None:
         stored["model"] = request.model
-    if request.api_key is not None:
-        stored["api_key"] = request.api_key
-    if request.api_base is not None:
-        stored["api_base"] = request.api_base
+    # NOTE: API keys are NOT written here anymore. They live in the encrypted
+    # per-provider store (PUT /config/api-keys). Writing the legacy single
+    # ``api_key`` slot here is what caused providers to overwrite each other and
+    # shadow the per-provider map in resolve_api_key. request.api_key is ignored
+    # for persistence (kept in the schema only for response masking/back-compat).
+    # api_base: distinguish "omitted" (leave unchanged) from "present but
+    # blank/null" (explicit clear). The frontend sends api_base: null/"" when
+    # the Base URL field is cleared; treating that as "don't change" left a
+    # stale override in config.json (issue #760). Normalize blank → None so an
+    # empty string also never reaches LiteLLM as a bogus endpoint.
+    if "api_base" in request.model_fields_set:
+        cleaned = (request.api_base or "").strip()
+        stored["api_base"] = cleaned or None
+    if request.reasoning_effort is not None:
+        # Persist empty string on clear so the gpt-5 auto-migration doesn't
+        # re-fire on next get_llm_config() call.
+        stored["reasoning_effort"] = request.reasoning_effort
 
-    # Build normalized config for response
+    # Build normalized config for response and background health check
+    resolved_provider = stored.get("provider", settings.llm_provider)
+
+    # M-05: `requiresBaseUrl` was enforced in the settings UI only, so the
+    # .env-driven path could persist a provider that cannot work without an
+    # endpoint. Fail at save time with a field name instead of surfacing an
+    # opaque LiteLLM error on the user's first generation.
+    if resolved_provider in PROVIDERS_REQUIRING_BASE_URL and not (
+        _effective_api_base(stored)
+    ):
+        # Structured detail using the same {code, field, missing} shape as
+        # update_feature_prompts below, so the UI has one schema to read for
+        # every validation error out of this router.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "missing_base_url",
+                "field": "api_base",
+                "missing": ["api_base"],
+            },
+        )
+    raw_re = stored.get("reasoning_effort", settings.reasoning_effort)
+    resolved_reasoning_effort = raw_re if raw_re else None
     test_config = LLMConfig(
-        provider=stored.get("provider", settings.llm_provider),
+        provider=resolved_provider,
         model=stored.get("model", settings.llm_model),
-        api_key=stored.get("api_key", settings.llm_api_key),
-        api_base=stored.get("api_base", settings.llm_api_base),
+        api_key=resolve_api_key(stored, resolved_provider),
+        api_base=_effective_api_base(stored),
+        reasoning_effort=resolved_reasoning_effort,
     )
 
     # Save config regardless of health check outcome (see docstring).
@@ -144,6 +208,7 @@ async def update_llm_config(
         model=test_config.model,
         api_key=_mask_api_key(test_config.api_key),
         api_base=test_config.api_base,
+        reasoning_effort=test_config.reasoning_effort,
     )
 
 
@@ -157,12 +222,13 @@ async def test_llm_connection(request: LLMConfigRequest | None = None) -> dict:
     stored = _load_config()
 
     # Build config: use request values if provided, otherwise fall back to stored/default
+    test_provider = (
+        request.provider
+        if request and request.provider
+        else stored.get("provider", settings.llm_provider)
+    )
     config = LLMConfig(
-        provider=(
-            request.provider
-            if request and request.provider
-            else stored.get("provider", settings.llm_provider)
-        ),
+        provider=test_provider,
         model=(
             request.model
             if request and request.model
@@ -171,12 +237,17 @@ async def test_llm_connection(request: LLMConfigRequest | None = None) -> dict:
         api_key=(
             request.api_key
             if request and request.api_key
-            else stored.get("api_key", settings.llm_api_key)
+            else resolve_api_key(stored, test_provider)
         ),
         api_base=(
             request.api_base
             if request and request.api_base is not None
-            else stored.get("api_base", settings.llm_api_base)
+            else _effective_api_base(stored)
+        ),
+        reasoning_effort=(
+            (request.reasoning_effort or None)
+            if request and request.reasoning_effort is not None
+            else (stored.get("reasoning_effort") or settings.reasoning_effort) or None
         ),
     )
 
@@ -192,6 +263,7 @@ async def get_feature_config() -> FeatureConfigResponse:
     return FeatureConfigResponse(
         enable_cover_letter=stored.get("enable_cover_letter", False),
         enable_outreach_message=stored.get("enable_outreach_message", False),
+        enable_interview_prep=stored.get("enable_interview_prep", False),
     )
 
 
@@ -205,6 +277,8 @@ async def update_feature_config(request: FeatureConfigRequest) -> FeatureConfigR
         stored["enable_cover_letter"] = request.enable_cover_letter
     if request.enable_outreach_message is not None:
         stored["enable_outreach_message"] = request.enable_outreach_message
+    if request.enable_interview_prep is not None:
+        stored["enable_interview_prep"] = request.enable_interview_prep
 
     # Save config
     _save_config(stored)
@@ -212,11 +286,12 @@ async def update_feature_config(request: FeatureConfigRequest) -> FeatureConfigR
     return FeatureConfigResponse(
         enable_cover_letter=stored.get("enable_cover_letter", False),
         enable_outreach_message=stored.get("enable_outreach_message", False),
+        enable_interview_prep=stored.get("enable_interview_prep", False),
     )
 
 
 # Supported languages for i18n
-SUPPORTED_LANGUAGES = ["en", "es", "zh", "ja", "pt"]
+SUPPORTED_LANGUAGES = ["en", "es", "zh", "ja", "pt", "fr", "ko"]
 
 
 @router.get("/language", response_model=LanguageConfigResponse)
@@ -320,8 +395,92 @@ async def update_prompt_config(
     )
 
 
-# Supported API key providers
-SUPPORTED_PROVIDERS = ["openai", "anthropic", "google", "openrouter", "deepseek"]
+@router.get("/feature-prompts", response_model=FeaturePromptsResponse)
+async def get_feature_prompts() -> FeaturePromptsResponse:
+    """Get custom feature prompts (cover letter, outreach message).
+
+    Empty strings mean "use default". The ``*_default`` fields expose the
+    built-in prompts so the UI can show them as placeholder text without
+    duplicating the content client-side.
+    """
+    stored = _load_config()
+    return FeaturePromptsResponse(
+        cover_letter_prompt=stored.get("cover_letter_prompt", "") or "",
+        outreach_message_prompt=stored.get("outreach_message_prompt", "") or "",
+        cover_letter_default=COVER_LETTER_PROMPT,
+        outreach_message_default=OUTREACH_MESSAGE_PROMPT,
+    )
+
+
+@router.put("/feature-prompts", response_model=FeaturePromptsResponse)
+async def update_feature_prompts(
+    request: FeaturePromptsRequest,
+) -> FeaturePromptsResponse:
+    """Update custom feature prompts.
+
+    Non-empty prompts are validated for the three required placeholders
+    (``{job_description}``, ``{resume_data}``, ``{output_language}``).
+    Missing placeholders return a 422 with a structured detail so the UI
+    can list exactly which ones are absent. Empty strings clear the
+    override — persisted as ``""`` so runtime resolution falls back to the
+    built-in default.
+    """
+    stored = _load_config()
+
+    if request.cover_letter_prompt is not None:
+        prompt = request.cover_letter_prompt.strip()
+        if prompt:
+            missing = validate_prompt_placeholders(prompt)
+            if missing:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "missing_placeholders",
+                        "field": "cover_letter_prompt",
+                        "missing": missing,
+                    },
+                )
+        stored["cover_letter_prompt"] = prompt
+
+    if request.outreach_message_prompt is not None:
+        prompt = request.outreach_message_prompt.strip()
+        if prompt:
+            missing = validate_prompt_placeholders(prompt)
+            if missing:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "missing_placeholders",
+                        "field": "outreach_message_prompt",
+                        "missing": missing,
+                    },
+                )
+        stored["outreach_message_prompt"] = prompt
+
+    _save_config(stored)
+
+    return FeaturePromptsResponse(
+        cover_letter_prompt=stored.get("cover_letter_prompt", "") or "",
+        outreach_message_prompt=stored.get("outreach_message_prompt", "") or "",
+        cover_letter_default=COVER_LETTER_PROMPT,
+        outreach_message_default=OUTREACH_MESSAGE_PROMPT,
+    )
+
+
+# Supported API key providers (key-store names). ``openai_compatible`` and
+# ``ollama`` are included so secured local servers can store a key; they keep
+# their env-fallback skip in resolve_api_key.
+SUPPORTED_PROVIDERS = [
+    "openai",
+    "azure_foundry",
+    "anthropic",
+    "google",
+    "openrouter",
+    "deepseek",
+    "groq",
+    "openai_compatible",
+    "ollama",
+]
 
 
 def _mask_key_short(key: str | None) -> str | None:
@@ -374,6 +533,13 @@ async def update_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateRespons
             del stored_keys["openai"]
         updated.append("openai")
 
+    if request.azure_foundry is not None:
+        if request.azure_foundry:
+            stored_keys["azure_foundry"] = request.azure_foundry
+        elif "azure_foundry" in stored_keys:
+            del stored_keys["azure_foundry"]
+        updated.append("azure_foundry")
+
     if request.anthropic is not None:
         if request.anthropic:
             stored_keys["anthropic"] = request.anthropic
@@ -402,7 +568,29 @@ async def update_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateRespons
             del stored_keys["deepseek"]
         updated.append("deepseek")
 
+    if request.groq is not None:
+        if request.groq:
+            stored_keys["groq"] = request.groq
+        elif "groq" in stored_keys:
+            del stored_keys["groq"]
+        updated.append("groq")
+
+    if request.openai_compatible is not None:
+        if request.openai_compatible:
+            stored_keys["openai_compatible"] = request.openai_compatible
+        elif "openai_compatible" in stored_keys:
+            del stored_keys["openai_compatible"]
+        updated.append("openai_compatible")
+
+    if request.ollama is not None:
+        if request.ollama:
+            stored_keys["ollama"] = request.ollama
+        elif "ollama" in stored_keys:
+            del stored_keys["ollama"]
+        updated.append("ollama")
+
     save_api_keys_to_config(stored_keys)
+    invalidate_config_cache()
 
     return ApiKeysUpdateResponse(
         message=f"Updated {len(updated)} API key(s)",
@@ -432,6 +620,7 @@ async def delete_all_api_keys(confirm: str | None = None) -> dict:
             detail="Confirmation required. Pass confirm=CLEAR_ALL_KEYS query parameter.",
         )
     clear_all_api_keys()
+    invalidate_config_cache()
     return {"message": "All API keys have been cleared"}
 
 
@@ -452,6 +641,7 @@ async def delete_api_key(provider: str) -> dict:
         )
 
     delete_api_key_from_config(provider)
+    invalidate_config_cache()
 
     return {"message": f"API key for {provider} has been removed"}
 
@@ -481,5 +671,5 @@ async def reset_database_endpoint(request: ResetDatabaseRequest) -> dict:
             status_code=400,
             detail="Confirmation required. Pass confirm=RESET_ALL_DATA in request body.",
         )
-    db.reset_database()
+    await db.reset_database()
     return {"message": "Database and all data have been reset successfully"}

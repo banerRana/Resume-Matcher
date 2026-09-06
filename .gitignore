@@ -33,6 +33,11 @@ uv.lock
 # SQLite databases
 *.sqlite3
 *.db
+*.db-wal
+*.db-shm
+
+# Encryption secret for API keys at rest - NEVER COMMIT
+**/data/.secret_key
 
 # Test artifacts
 .pytest_cache/
@@ -52,8 +57,26 @@ apps/backend/data/config.json
 .cursor/
 .cursorrules
 
-# Claude Code local settings (personal overrides)
-.claude/settings.local.json
+# Claude Code — track only CLAUDE.md and settings.json, ignore everything else
+# (skills, subagents, thoughts, prompts, sessions are all personal workflow)
+.claude/*
+!.claude/CLAUDE.md
+!.claude/settings.json
+skills-lock.json
+
+# AI assistant tool folders (personal workflow, not tracked)
+.agents/
+.github/agents/
+.github/skills/
+.github/prompts/
+.github/copilot-instructions.md
+.kilocode/
+.gemini/
+.codex/
+.firecrawl/
+AGENTS.md
+GEMINI.md
+CODEX.md
 
 .DS_Store
 
@@ -105,3 +128,10 @@ next-env.d.ts
 # Config file with API keys - NEVER COMMIT
 config.json
 **/config.json
+
+# Agentic E2E monitor — runtime evidence bundles and the local-only skill
+/artifacts/
+/.claude/skills/monitor-e2e/
+
+# Superpowers brainstorming visual-companion scratch (local only)
+/.superpowers/

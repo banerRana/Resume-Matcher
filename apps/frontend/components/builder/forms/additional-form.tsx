@@ -16,8 +16,10 @@ export const AdditionalForm: React.FC<AdditionalFormProps> = ({ data, onChange }
 
   // Helper to handle array conversions (text -> string[])
   const handleArrayChange = (field: keyof AdditionalInfo, value: string) => {
-    // Split by newlines only (preserving spaces within items)
-    const items = value.split('\n').filter((item) => item.trim() !== '');
+    // Split by newlines only. Blank/whitespace lines are preserved while editing
+    // so pressing Enter creates a new line (issue #763); consumers filter empty
+    // entries at render time, and the backend drops them on save.
+    const items = value.split('\n');
     onChange({
       ...data,
       [field]: items,
@@ -38,7 +40,7 @@ export const AdditionalForm: React.FC<AdditionalFormProps> = ({ data, onChange }
 
   return (
     <div className="space-y-6">
-      <p className="font-mono text-xs text-blue-700 border-l-2 border-blue-700 pl-3">
+      <p className="font-mono text-xs uppercase tracking-wider text-blue-700">
         {t('builder.additionalForm.instructions')}
       </p>
 
@@ -46,7 +48,7 @@ export const AdditionalForm: React.FC<AdditionalFormProps> = ({ data, onChange }
         <div className="space-y-2">
           <Label
             htmlFor="technicalSkills"
-            className="font-mono text-xs uppercase tracking-wider text-gray-500"
+            className="font-mono text-xs uppercase tracking-wider text-steel-grey"
           >
             {t('resume.additional.technicalSkills')}
           </Label>
@@ -62,7 +64,7 @@ export const AdditionalForm: React.FC<AdditionalFormProps> = ({ data, onChange }
         <div className="space-y-2">
           <Label
             htmlFor="languages"
-            className="font-mono text-xs uppercase tracking-wider text-gray-500"
+            className="font-mono text-xs uppercase tracking-wider text-steel-grey"
           >
             {t('resume.sections.languages')}
           </Label>
@@ -78,7 +80,7 @@ export const AdditionalForm: React.FC<AdditionalFormProps> = ({ data, onChange }
         <div className="space-y-2">
           <Label
             htmlFor="certifications"
-            className="font-mono text-xs uppercase tracking-wider text-gray-500"
+            className="font-mono text-xs uppercase tracking-wider text-steel-grey"
           >
             {t('resume.sections.certifications')}
           </Label>
@@ -94,7 +96,7 @@ export const AdditionalForm: React.FC<AdditionalFormProps> = ({ data, onChange }
         <div className="space-y-2">
           <Label
             htmlFor="awards"
-            className="font-mono text-xs uppercase tracking-wider text-gray-500"
+            className="font-mono text-xs uppercase tracking-wider text-steel-grey"
           >
             {t('resume.sections.awards')}
           </Label>

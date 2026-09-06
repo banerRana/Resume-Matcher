@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState, useRef, useLayoutEffect } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -14,17 +14,31 @@ import {
   renameResume,
 } from '@/lib/api/resume';
 import { useStatusCache } from '@/lib/context/status-cache';
-import { ArrowLeft, Edit, Download, Loader2, AlertCircle, Sparkles, Pencil } from 'lucide-react';
+import {
+  ArrowLeft,
+  Edit,
+  Download,
+  Loader2,
+  AlertCircle,
+  Sparkles,
+  Pencil,
+  MessagesSquare,
+} from 'lucide-react';
 import { EnrichmentModal } from '@/components/enrichment/enrichment-modal';
 import { useTranslations } from '@/lib/i18n';
 import { withLocalizedDefaultSections } from '@/lib/utils/section-helpers';
 import { useLanguage } from '@/lib/context/language-context';
 import { downloadBlobAsFile, openUrlInNewTab, sanitizeFilename } from '@/lib/utils/download';
+import { useOperationOwner } from '@/hooks/use-operation-owner';
 
 type ProcessingStatus = 'pending' | 'processing' | 'ready' | 'failed';
 
 export default function ResumeViewerPage() {
   const { t } = useTranslations();
+  const translationsRef = useRef(t);
+  useLayoutEffect(() => {
+    translationsRef.current = t;
+  }, [t]);
   const { uiLanguage } = useLanguage();
   const params = useParams();
   const router = useRouter();
@@ -38,13 +52,27 @@ export default function ResumeViewerPage() {
   const [showDeleteSuccessDialog, setShowDeleteSuccessDialog] = useState(false);
   const [showDownloadSuccessDialog, setShowDownloadSuccessDialog] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [renameError, setRenameError] = useState<string | null>(null);
   const [showEnrichmentModal, setShowEnrichmentModal] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
   const [resumeTitle, setResumeTitle] = useState<string | null>(null);
+  const renameBusyRef = useRef(false);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editingTitleValue, setEditingTitleValue] = useState('');
+  const [isTailoredResume, setIsTailoredResume] = useState(false);
 
   const resumeId = params?.id as string;
+  const {
+    begin: beginResumeLoad,
+    isCurrent: isCurrentResumeLoad,
+    invalidate: invalidateResumeLoad,
+  } = useOperationOwner(resumeId);
+  const { begin: beginRetry, isCurrent: isCurrentRetry } = useOperationOwner(resumeId);
+  const { begin: beginRename, isCurrent: isCurrentRename } = useOperationOwner(resumeId);
+  const { begin: beginDownload, isCurrent: isCurrentDownload } = useOperationOwner(resumeId);
+  const { begin: beginDelete, isCurrent: isCurrentDelete } = useOperationOwner(resumeId);
 
   const localizedResumeData = useMemo(() => {
     if (!resumeData) return null;
@@ -53,12 +81,27 @@ export default function ResumeViewerPage() {
 
   useEffect(() => {
     if (!resumeId) return;
+    setShowEnrichmentModal(false);
+    setIsRetrying(false);
+    setIsDownloading(false);
+    renameBusyRef.current = false;
+    setIsEditingTitle(false);
+    setEditingTitleValue('');
+    setRenameError(null);
+    setDownloadError(null);
+    setDeleteError(null);
+    setShowDeleteDialog(false);
+    setShowDeleteSuccessDialog(false);
+    setShowDownloadSuccessDialog(false);
+    const token = beginResumeLoad();
+    if (token === null) return;
 
     const loadResume = async () => {
       try {
         setLoading(true);
         setError(null);
         const data = await fetchResume(resumeId);
+        if (!isCurrentResumeLoad(token)) return;
 
         // Get processing status
         const status = (data.raw_resume?.processing_status || 'pending') as ProcessingStatus;
@@ -66,54 +109,77 @@ export default function ResumeViewerPage() {
 
         // Capture title for editable display (always set to clear stale state)
         setResumeTitle(data.title ?? null);
+        setIsTailoredResume(Boolean(data.parent_id));
 
         // Prioritize processed_resume if available (structured JSON)
         if (data.processed_resume) {
           setResumeData(data.processed_resume as ResumeData);
           setError(null);
         } else if (status === 'failed') {
-          setError(t('resumeViewer.errors.processingFailed'));
+          setError(translationsRef.current('resumeViewer.errors.processingFailed'));
         } else if (status === 'processing') {
-          setError(t('resumeViewer.errors.stillProcessing'));
+          setError(translationsRef.current('resumeViewer.errors.stillProcessing'));
         } else if (data.raw_resume?.content) {
           // Try to parse raw_resume content as JSON (for tailored resumes stored as JSON)
           try {
             const parsed = JSON.parse(data.raw_resume.content);
             setResumeData(parsed as ResumeData);
           } catch {
-            setError(t('resumeViewer.errors.notProcessedYet'));
+            setError(translationsRef.current('resumeViewer.errors.notProcessedYet'));
           }
         } else {
-          setError(t('resumeViewer.errors.noDataAvailable'));
+          setError(translationsRef.current('resumeViewer.errors.noDataAvailable'));
         }
       } catch (err) {
+        if (!isCurrentResumeLoad(token)) return;
         console.error('Failed to load resume:', err);
-        setError(t('resumeViewer.errors.failedToLoad'));
+        setError(translationsRef.current('resumeViewer.errors.failedToLoad'));
       } finally {
-        setLoading(false);
+        if (isCurrentResumeLoad(token)) setLoading(false);
       }
     };
 
     loadResume();
     setIsMasterResume(localStorage.getItem('master_resume_id') === resumeId);
-  }, [resumeId, t]);
+  }, [resumeId, beginResumeLoad, isCurrentResumeLoad]);
 
   const handleRetryProcessing = async () => {
     if (!resumeId) return;
+    const token = beginRetry();
+    if (token === null) return;
     setIsRetrying(true);
     try {
       const result = await retryProcessing(resumeId);
+      if (!isCurrentRetry(token)) return;
+      setProcessingStatus(result.processing_status);
       if (result.processing_status === 'ready') {
         // Reload the page to show the processed resume
         window.location.reload();
       } else {
-        setError(t('resumeViewer.errors.processingFailed'));
+        setError(
+          t(
+            result.processing_status === 'failed'
+              ? 'resumeViewer.errors.processingFailed'
+              : 'resumeViewer.errors.stillProcessing'
+          )
+        );
       }
     } catch (err) {
-      console.error('Retry processing failed:', err);
-      setError(t('resumeViewer.errors.processingFailed'));
+      if (err instanceof Error && err.message.includes('status 404')) {
+        if (localStorage.getItem('master_resume_id') === resumeId) {
+          localStorage.removeItem('master_resume_id');
+          setHasMasterResume(false);
+        }
+        if (!isCurrentRetry(token)) return;
+        setProcessingStatus(null);
+        setError(t('common.resumeDeleted'));
+      } else {
+        if (!isCurrentRetry(token)) return;
+        console.error('Retry processing failed:', err);
+        setError(t('resumeViewer.errors.processingFailed'));
+      }
     } finally {
-      setIsRetrying(false);
+      if (isCurrentRetry(token)) setIsRetrying(false);
     }
   };
 
@@ -121,19 +187,34 @@ export default function ResumeViewerPage() {
     router.push(`/builder?id=${resumeId}`);
   };
 
+  const handleInterviewPrep = () => {
+    router.push(`/builder?id=${resumeId}&tab=interview-prep`);
+  };
+
   const handleTitleSave = async () => {
+    if (renameBusyRef.current) return;
     const trimmed = editingTitleValue.trim();
     if (!trimmed || trimmed === resumeTitle) {
       setIsEditingTitle(false);
       return;
     }
-    try {
-      await renameResume(resumeId, trimmed);
-      setResumeTitle(trimmed);
-    } catch (err) {
-      console.error('Failed to rename resume:', err);
-    }
+    const token = beginRename();
+    if (token === null) return;
+    renameBusyRef.current = true;
     setIsEditingTitle(false);
+    try {
+      setRenameError(null);
+      await renameResume(resumeId, trimmed);
+      if (!isCurrentRename(token)) return;
+      setResumeTitle(trimmed);
+      setIsEditingTitle(false);
+    } catch (err) {
+      if (!isCurrentRename(token)) return;
+      console.error('Failed to rename resume:', err);
+      setRenameError(t('resumeViewer.errors.failedToRename'));
+    } finally {
+      if (isCurrentRename(token)) renameBusyRef.current = false;
+    }
   };
 
   const handleTitleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -145,55 +226,79 @@ export default function ResumeViewerPage() {
   };
 
   // Reload resume data after enrichment
-  const reloadResumeData = async () => {
+  const reloadResumeData = async (): Promise<boolean> => {
+    const token = beginResumeLoad();
+    if (token === null) return false;
     try {
       const data = await fetchResume(resumeId);
-      if (data.processed_resume) {
-        setResumeData(data.processed_resume as ResumeData);
-        setError(null);
-      }
+      if (!isCurrentResumeLoad(token)) return false;
+      if (!data.processed_resume) throw new Error('Refreshed resume has no processed data');
+      setResumeData(data.processed_resume as ResumeData);
+      setError(null);
+      return true;
     } catch (err) {
+      if (!isCurrentResumeLoad(token)) return false;
       console.error('Failed to reload resume:', err);
+      throw err;
     }
   };
 
-  const handleEnrichmentComplete = () => {
+  const handleEnrichmentComplete = async (): Promise<boolean> => {
+    const refreshed = await reloadResumeData();
+    if (refreshed) setShowEnrichmentModal(false);
+    return refreshed;
+  };
+
+  const handleEnrichmentClose = () => {
+    invalidateResumeLoad();
     setShowEnrichmentModal(false);
-    reloadResumeData();
   };
 
   const handleDownload = async () => {
+    const token = beginDownload();
+    if (token === null) return;
+    setIsDownloading(true);
     try {
+      setDownloadError(null);
       const blob = await downloadResumePdf(resumeId, undefined, uiLanguage);
       const filename = sanitizeFilename(resumeTitle, resumeId, 'resume');
       downloadBlobAsFile(blob, filename);
+      if (!isCurrentDownload(token)) return;
       setShowDownloadSuccessDialog(true);
     } catch (err) {
+      if (!isCurrentDownload(token)) return;
       console.error('Failed to download resume:', err);
       if (err instanceof TypeError && err.message.includes('Failed to fetch')) {
         const fallbackUrl = getResumePdfUrl(resumeId, undefined, uiLanguage);
         const didOpen = openUrlInNewTab(fallbackUrl);
         if (!didOpen) {
-          alert(t('common.popupBlocked', { url: fallbackUrl }));
+          setDownloadError(t('common.popupBlocked', { url: fallbackUrl }));
         }
         return;
       }
+      setDownloadError(t('resumeViewer.errors.failedToDownload'));
+    } finally {
+      if (isCurrentDownload(token)) setIsDownloading(false);
     }
   };
 
   const handleDeleteResume = async () => {
+    const token = beginDelete();
+    if (token === null) return;
     try {
       setDeleteError(null);
       await deleteResume(resumeId);
       // Update cached counters
       decrementResumes();
-      if (isMasterResume) {
+      if (localStorage.getItem('master_resume_id') === resumeId) {
         localStorage.removeItem('master_resume_id');
         setHasMasterResume(false);
       }
+      if (!isCurrentDelete(token)) return;
       setShowDeleteDialog(false);
       setShowDeleteSuccessDialog(true);
     } catch (err) {
+      if (!isCurrentDelete(token)) return;
       console.error('Failed to delete resume:', err);
       setDeleteError(t('resumeViewer.errors.failedToDelete'));
       setShowDeleteDialog(false);
@@ -209,9 +314,64 @@ export default function ResumeViewerPage() {
     setShowDownloadSuccessDialog(false);
   };
 
+  // Delete-related dialogs, shared by the failed-processing error branch and the
+  // main viewer branch so the "Delete & Start Over" recovery action works in the
+  // error state. Previously these lived only in the main branch, so on the error
+  // path the confirm dialog never mounted and the delete request was never sent.
+  // (The loading branch omits them — it has no delete affordance.)
+  const deleteDialogs = (
+    <>
+      <ConfirmDialog
+        open={showDeleteDialog}
+        onOpenChange={setShowDeleteDialog}
+        title={
+          isMasterResume ? t('confirmations.deleteMasterResumeTitle') : t('dashboard.deleteResume')
+        }
+        description={
+          isMasterResume
+            ? t('confirmations.deleteMasterResumeDescription')
+            : t('confirmations.deleteResumeFromSystemDescription')
+        }
+        confirmLabel={t('confirmations.deleteResumeConfirmLabel')}
+        cancelLabel={t('confirmations.keepResumeCancelLabel')}
+        onConfirm={handleDeleteResume}
+        variant="danger"
+      />
+
+      <ConfirmDialog
+        open={showDeleteSuccessDialog}
+        onOpenChange={setShowDeleteSuccessDialog}
+        title={t('resumeViewer.deletedTitle')}
+        description={
+          isMasterResume
+            ? t('resumeViewer.deletedDescriptionMaster')
+            : t('resumeViewer.deletedDescriptionRegular')
+        }
+        confirmLabel={t('resumeViewer.returnToDashboard')}
+        onConfirm={handleDeleteSuccessConfirm}
+        variant="success"
+        showCancelButton={false}
+      />
+
+      {deleteError && (
+        <ConfirmDialog
+          open={!!deleteError}
+          onOpenChange={() => setDeleteError(null)}
+          title={t('resumeViewer.deleteFailedTitle')}
+          description={deleteError}
+          confirmLabel={t('common.retry')}
+          cancelLabel={t('common.cancel')}
+          onConfirm={handleDeleteResume}
+          onCancel={() => setDeleteError(null)}
+          variant="danger"
+        />
+      )}
+    </>
+  );
+
   if (loading) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-[#F0F0E8]">
+      <div className="min-h-screen flex flex-col items-center justify-center bg-background">
         <Loader2 className="w-10 h-10 animate-spin text-blue-700 mb-4" />
         <p className="font-mono text-sm font-bold uppercase text-blue-700">
           {t('resumeViewer.loading')}
@@ -225,61 +385,64 @@ export default function ResumeViewerPage() {
     const isFailed = processingStatus === 'failed';
 
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-[#F0F0E8] p-4">
-        <div
-          className={`border p-6 text-center max-w-md shadow-[4px_4px_0px_0px_rgba(0,0,0,0.1)] ${
-            isProcessing
-              ? 'bg-blue-50 border-blue-200'
-              : isFailed
-                ? 'bg-orange-50 border-orange-200'
-                : 'bg-red-50 border-red-200'
-          }`}
-        >
-          <div className="flex justify-center mb-4">
-            {isProcessing ? (
-              <Loader2 className="w-8 h-8 animate-spin text-blue-700" />
-            ) : isFailed ? (
-              <AlertCircle className="w-8 h-8 text-orange-600" />
-            ) : (
-              <AlertCircle className="w-8 h-8 text-red-600" />
-            )}
-          </div>
-          <p
-            className={`font-bold mb-4 ${
-              isProcessing ? 'text-blue-700' : isFailed ? 'text-orange-700' : 'text-red-700'
+      <>
+        <div className="min-h-screen flex flex-col items-center justify-center bg-background p-4">
+          <div
+            className={`border p-6 text-center max-w-md shadow-sw-default ${
+              isProcessing
+                ? 'bg-blue-50 border-blue-200'
+                : isFailed
+                  ? 'bg-orange-50 border-orange-200'
+                  : 'bg-red-50 border-red-200'
             }`}
           >
-            {error || t('resumeViewer.resumeNotFound')}
-          </p>
-          <div className="flex flex-col gap-2">
-            {isFailed && (
-              <>
-                <Button onClick={handleRetryProcessing} disabled={isRetrying}>
-                  {isRetrying ? (
-                    <>
-                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                      {t('common.processing')}
-                    </>
-                  ) : (
-                    t('resumeViewer.retryProcessing')
-                  )}
-                </Button>
-                <Button variant="destructive" onClick={() => setShowDeleteDialog(true)}>
-                  {t('resumeViewer.deleteAndStartOver')}
-                </Button>
-              </>
-            )}
-            <Button variant="outline" onClick={() => router.push('/dashboard')}>
-              {t('resumeViewer.returnToDashboard')}
-            </Button>
+            <div className="flex justify-center mb-4">
+              {isProcessing ? (
+                <Loader2 className="w-8 h-8 animate-spin text-blue-700" />
+              ) : isFailed ? (
+                <AlertCircle className="w-8 h-8 text-orange-600" />
+              ) : (
+                <AlertCircle className="w-8 h-8 text-red-600" />
+              )}
+            </div>
+            <p
+              className={`font-bold mb-4 ${
+                isProcessing ? 'text-blue-700' : isFailed ? 'text-orange-700' : 'text-red-700'
+              }`}
+            >
+              {error || t('resumeViewer.resumeNotFound')}
+            </p>
+            <div className="flex flex-col gap-2">
+              {isFailed && (
+                <>
+                  <Button onClick={handleRetryProcessing} disabled={isRetrying}>
+                    {isRetrying ? (
+                      <>
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                        {t('common.processing')}
+                      </>
+                    ) : (
+                      t('resumeViewer.retryProcessing')
+                    )}
+                  </Button>
+                  <Button variant="destructive" onClick={() => setShowDeleteDialog(true)}>
+                    {t('resumeViewer.deleteAndStartOver')}
+                  </Button>
+                </>
+              )}
+              <Button variant="outline" onClick={() => router.push('/dashboard')}>
+                {t('resumeViewer.returnToDashboard')}
+              </Button>
+            </div>
           </div>
         </div>
-      </div>
+        {deleteDialogs}
+      </>
     );
   }
 
   return (
-    <div className="min-h-screen bg-[#F0F0E8] py-12 px-4 md:px-8 overflow-y-auto">
+    <div className="min-h-screen bg-background py-12 px-4 md:px-8 overflow-y-auto">
       <div className="max-w-7xl mx-auto">
         {/* Header Actions */}
         <div className="mb-8 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 no-print">
@@ -299,9 +462,15 @@ export default function ResumeViewerPage() {
               <Edit className="w-4 h-4" />
               {t('dashboard.editResume')}
             </Button>
-            <Button variant="success" onClick={handleDownload}>
+            {isTailoredResume && (
+              <Button variant="outline" onClick={handleInterviewPrep}>
+                <MessagesSquare className="w-4 h-4" />
+                {t('interviewPrep.title')}
+              </Button>
+            )}
+            <Button variant="success" onClick={handleDownload} disabled={isDownloading}>
               <Download className="w-4 h-4" />
-              {t('resumeViewer.downloadResume')}
+              {isDownloading ? t('common.generating') : t('resumeViewer.downloadResume')}
             </Button>
           </div>
         </div>
@@ -330,7 +499,7 @@ export default function ResumeViewerPage() {
                 className="group flex items-center gap-2 cursor-pointer bg-transparent border-none p-0"
               >
                 <h2
-                  className={`font-serif text-2xl font-bold border-b-2 border-transparent group-hover:border-black transition-colors ${!resumeTitle ? 'text-gray-400' : ''}`}
+                  className={`font-serif text-2xl font-bold border-b-2 border-transparent group-hover:border-black transition-colors ${!resumeTitle ? 'text-steel-grey' : ''}`}
                 >
                   {resumeTitle || t('resumeViewer.titlePlaceholder')}
                 </h2>
@@ -344,7 +513,7 @@ export default function ResumeViewerPage() {
 
         {/* Resume Viewer */}
         <div className="flex justify-center pb-4">
-          <div className="resume-print w-full max-w-[250mm] shadow-[8px_8px_0px_0px_#000000] border-2 border-black bg-white">
+          <div className="resume-print w-full max-w-[250mm] shadow-sw-lg border-2 border-black bg-white">
             <Resume
               resumeData={localizedResumeData || resumeData}
               additionalSectionLabels={{
@@ -378,36 +547,30 @@ export default function ResumeViewerPage() {
         </div>
       </div>
 
+      {deleteDialogs}
+
       <ConfirmDialog
-        open={showDeleteDialog}
-        onOpenChange={setShowDeleteDialog}
-        title={
-          isMasterResume ? t('confirmations.deleteMasterResumeTitle') : t('dashboard.deleteResume')
-        }
-        description={
-          isMasterResume
-            ? t('confirmations.deleteMasterResumeDescription')
-            : t('confirmations.deleteResumeFromSystemDescription')
-        }
-        confirmLabel={t('confirmations.deleteResumeConfirmLabel')}
-        cancelLabel={t('confirmations.keepResumeCancelLabel')}
-        onConfirm={handleDeleteResume}
+        open={downloadError !== null}
+        onOpenChange={(open) => !open && setDownloadError(null)}
+        title={t('resumeViewer.downloadFailedTitle')}
+        description={downloadError ?? ''}
+        confirmLabel={t('common.retry')}
+        cancelLabel={t('common.cancel')}
+        onConfirm={handleDownload}
+        onCancel={() => setDownloadError(null)}
         variant="danger"
       />
 
       <ConfirmDialog
-        open={showDeleteSuccessDialog}
-        onOpenChange={setShowDeleteSuccessDialog}
-        title={t('resumeViewer.deletedTitle')}
-        description={
-          isMasterResume
-            ? t('resumeViewer.deletedDescriptionMaster')
-            : t('resumeViewer.deletedDescriptionRegular')
-        }
-        confirmLabel={t('resumeViewer.returnToDashboard')}
-        onConfirm={handleDeleteSuccessConfirm}
-        variant="success"
-        showCancelButton={false}
+        open={renameError !== null}
+        onOpenChange={(open) => !open && setRenameError(null)}
+        title={t('resumeViewer.renameFailedTitle')}
+        description={renameError ?? ''}
+        confirmLabel={t('common.retry')}
+        cancelLabel={t('common.cancel')}
+        onConfirm={handleTitleSave}
+        onCancel={() => setRenameError(null)}
+        variant="danger"
       />
 
       <ConfirmDialog
@@ -421,25 +584,12 @@ export default function ResumeViewerPage() {
         showCancelButton={false}
       />
 
-      {deleteError && (
-        <ConfirmDialog
-          open={!!deleteError}
-          onOpenChange={() => setDeleteError(null)}
-          title={t('resumeViewer.deleteFailedTitle')}
-          description={deleteError}
-          confirmLabel={t('common.ok')}
-          onConfirm={() => setDeleteError(null)}
-          variant="danger"
-          showCancelButton={false}
-        />
-      )}
-
       {/* Enrichment Modal - Only for master resume */}
       {isMasterResume && (
         <EnrichmentModal
           resumeId={resumeId}
           isOpen={showEnrichmentModal}
-          onClose={() => setShowEnrichmentModal(false)}
+          onClose={handleEnrichmentClose}
           onComplete={handleEnrichmentComplete}
         />
       )}

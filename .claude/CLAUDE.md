@@ -6,26 +6,26 @@
 
 ## Project Overview
 
-Resume Matcher is an AI-powered application for tailoring resumes to job descriptions.
+Resume Matcher is an AI-powered application for tailoring resumes to job descriptions, with a Kanban Application Tracker for managing the job-application pipeline.
 
 | Layer | Stack |
 |-------|-------|
 | **Backend** | FastAPI + Python 3.13+, LiteLLM (multi-provider AI) |
 | **Frontend** | Next.js 16 + React 19, Tailwind CSS v4 |
-| **Database** | TinyDB (JSON file storage) |
+| **Database** | SQLite (SQLAlchemy 2.0 async / aiosqlite) |
 | **PDF** | Headless Chromium via Playwright |
 
 ---
 
 ## First Steps
 
-**Before exploring code, read the [navigator skill](/.claude/skills/navigator/SKILL.md)** for codebase orientation.
+Before exploring code, read [docs/agent/README.md](../docs/agent/README.md) for project orientation.
 
 ---
 
 ## Non-Negotiable Rules
 
-1. **All frontend UI changes** MUST follow [Swiss International Style](../docs/agent/design/style-guide.md)
+1. **All frontend UI changes** MUST follow [Swiss International Style](../docs/portable/swiss-design-system/README.md) — see [tokens](../docs/portable/swiss-design-system/tokens.md), [components](../docs/portable/swiss-design-system/components.md), [anti-patterns](../docs/portable/swiss-design-system/anti-patterns.md)
 2. **All Python functions** MUST have type hints
 3. **Run `npm run lint`** before committing frontend changes
 4. **Run `npm run format`** (Prettier) before committing
@@ -37,21 +37,23 @@ Resume Matcher is an AI-powered application for tailoring resumes to job descrip
 ## Essential Commands
 
 ```bash
-# Install all dependencies
-npm run install
+# Backend (from repo root)
+cd apps/backend
+uv sync --extra dev                                  # Install Python deps (incl. test deps)
+uv run uvicorn app.main:app --reload --port 8000     # FastAPI on :8000
+uv run pytest                                        # Run backend tests (~444; LLM evals excluded)
 
-# Development (both servers)
-npm run dev
+# Frontend (from repo root, in a separate terminal)
+cd apps/frontend
+npm install                                          # Install Node.js dependencies
+npm run dev                                          # Next.js on :3000
+npm run test                                         # Run frontend tests (vitest)
 
-# Individual servers
-npm run dev:backend   # FastAPI on :8000
-npm run dev:frontend  # Next.js on :3000
-
-# Quality checks
+# Quality checks (from apps/frontend)
 npm run lint          # Lint frontend
 npm run format        # Format with Prettier
 
-# Build
+# Build (from apps/frontend)
 npm run build
 ```
 
@@ -65,20 +67,24 @@ apps/
 │   ├── app/
 │   │   ├── main.py          # Entry point
 │   │   ├── config.py        # Environment settings
-│   │   ├── database.py      # TinyDB wrapper
+│   │   ├── database.py      # Async SQLAlchemy/SQLite facade
+│   │   ├── models.py        # SQLAlchemy ORM models (Resume/Job/Improvement/Application/ApiKey)
+│   │   ├── db_engine.py     # Async + sync SQLite engines (WAL/FK pragmas)
+│   │   ├── crypto.py        # Fernet encrypt/decrypt for API keys at rest
 │   │   ├── llm.py           # LiteLLM wrapper
-│   │   ├── routers/         # API endpoints
+│   │   ├── routers/         # API endpoints (incl. applications.py = tracker)
 │   │   ├── services/        # Business logic
-│   │   ├── schemas/         # Pydantic models
-│   │   └── prompts/         # LLM prompt templates
-│   └── data/                # Database storage
+│   │   ├── schemas/         # Pydantic models (incl. applications.py)
+│   │   ├── prompts/         # LLM prompt templates
+│   │   └── scripts/         # One-time TinyDB→SQLite migration (runs on startup)
+│   └── data/                # resume_matcher.db (SQLite) + encrypted API keys + .secret_key
 │
 └── frontend/                # Next.js + React
-    ├── app/                 # Pages (dashboard, builder, tailor, print)
-    ├── components/          # UI components
-    ├── lib/                 # Utilities, API client
+    ├── app/                 # Pages (dashboard, builder, tailor, tracker, print)
+    ├── components/          # UI components (incl. tracker/)
+    ├── lib/                 # Utilities, API client (incl. api/tracker.ts)
     ├── hooks/               # Custom React hooks
-    └── messages/            # i18n translations (en, es, zh, ja)
+    └── messages/            # i18n translations (en, es, zh, ja, pt)
 ```
 
 ---
@@ -92,8 +98,12 @@ apps/
 
 ### For Frontend Changes
 1. [Frontend workflow](../docs/agent/architecture/frontend-workflow.md) - User flow, components
-2. [Style guide](../docs/agent/design/style-guide.md) - **REQUIRED** Swiss International Style
-3. [Coding standards](../docs/agent/coding-standards.md) - Frontend conventions
+2. [Swiss design system pack](../docs/portable/swiss-design-system/README.md) - **REQUIRED** Swiss International Style (portable pack)
+3. [Next.js performance pack](../docs/portable/nextjs-performance/README.md) - **REQUIRED** Next.js 15 perf patterns (portable pack)
+4. [Coding standards](../docs/agent/coding-standards.md) - Frontend conventions
+
+### For Testing
+1. [Testing strategy](../docs/agent/testing-strategy.md) - Current-state assessment, framework, phased plan, how to run + how we verify (anti-theater)
 
 ### For Template/PDF Changes
 1. [PDF template guide](../docs/agent/design/pdf-template-guide.md) - PDF rendering
@@ -103,6 +113,7 @@ apps/
 ### For Features
 | Feature | Documentation |
 |---------|---------------|
+| Application tracker | [application-tracker.md](../docs/agent/features/application-tracker.md) |
 | Custom sections | [custom-sections.md](../docs/agent/features/custom-sections.md) |
 | Resume templates | [resume-templates.md](../docs/agent/features/resume-templates.md) |
 | i18n | [i18n.md](../docs/agent/features/i18n.md) |
@@ -138,6 +149,21 @@ data = copy.deepcopy(DEFAULT_DATA)  # Correct
 
 ---
 
+## Testing
+
+Both apps have real test suites, and **tests are in scope** (deliberate testing initiative — full plan in [docs/agent/testing-strategy.md](../docs/agent/testing-strategy.md)).
+
+| Suite | Stack | Run |
+|-------|-------|-----|
+| Backend | pytest + pytest-asyncio + httpx + respx | `cd apps/backend && uv run pytest` |
+| Frontend | vitest + Testing Library (jsdom) | `cd apps/frontend && npm run test` |
+
+- **Backend layers:** `tests/unit` (pure logic), `tests/service` (mocked LLM), `tests/integration` (real routers via httpx ASGI), `tests/evals` (prompt-quality scorers + a gated LLM-judge — excluded by default; run with `uv run pytest -m eval`).
+- **Local push gate (not CI):** a `pre-push` hook (`.githooks/pre-push`) runs the backend suite + a locale-parity check and **blocks red pushes**. Activate once per clone: `git config core.hooksPath .githooks`. We deliberately avoid a GitHub Actions PR gate (high external-PR volume) — see [`.githooks/README.md`](../.githooks/README.md).
+- Keep tests **deterministic and anti-theater**: a test must fail when its target breaks, and the default suites make no real network/LLM calls.
+
+---
+
 ## Design System Quick Reference
 
 | Element | Value |
@@ -160,10 +186,12 @@ data = copy.deepcopy(DEFAULT_DATA)  # Correct
 Before completing a task:
 
 - [ ] Code compiles without errors
+- [ ] Backend tests pass (`uv run pytest`); frontend tests pass (`npm run test`)
 - [ ] `npm run lint` passes
 - [ ] UI changes follow Swiss International Style
 - [ ] Python functions have type hints
 - [ ] Schema/prompt changes documented
+- [ ] New behavior covered by a deterministic test (it must fail if the behavior breaks)
 
 ---
 

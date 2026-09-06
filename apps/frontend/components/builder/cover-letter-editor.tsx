@@ -44,7 +44,7 @@ export function CoverLetterEditor({
           </h2>
         </div>
         <div className="flex items-center gap-3">
-          <span className="font-mono text-xs text-gray-500">
+          <span className="font-mono text-xs text-steel-grey">
             {t('builder.contentStats.wordsChars', { wordCount, charCount })}
           </span>
           <Button size="sm" onClick={onSave} disabled={isSaving}>
@@ -59,6 +59,7 @@ export function CoverLetterEditor({
         <textarea
           value={content}
           onChange={(e) => onChange(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && e.stopPropagation()}
           placeholder={t('coverLetter.editor.placeholder')}
           className={cn(
             'w-full h-full min-h-[400px] p-4',
@@ -66,14 +67,14 @@ export function CoverLetterEditor({
             'border-2 border-black bg-white',
             'resize-none',
             'focus:outline-none focus:ring-2 focus:ring-blue-700 focus:ring-offset-2',
-            'placeholder:text-gray-400'
+            'placeholder:text-steel-grey'
           )}
         />
       </div>
 
       {/* Footer Tips */}
-      <div className="p-4 border-t border-gray-200 bg-[#F5F5F0]">
-        <p className="font-mono text-xs text-gray-500">{t('coverLetter.editor.tip')}</p>
+      <div className="p-4 border-t border-paper-tint bg-[#F5F5F0]">
+        <p className="font-mono text-xs text-steel-grey">{t('coverLetter.editor.tip')}</p>
       </div>
     </div>
   );
